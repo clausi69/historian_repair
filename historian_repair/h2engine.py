@@ -118,6 +118,13 @@ def format_for_version(version: Optional[str]) -> Optional[int]:
     return 3
 
 
+def _version_tuple(v: Optional[str]) -> tuple:
+    try:
+        return tuple(int(x) for x in re.findall(r"\d+", v or "")[:3])
+    except ValueError:
+        return ()
+
+
 def is_v1(version: Optional[str]) -> bool:
     return bool(version) and version.startswith("1.")
 
@@ -436,15 +443,18 @@ class Database:
         self.tables: dict[str, TableInfo] = {}
         self.datapoints: list[dict] = []
         self.recovered_from: Optional[str] = None
+        self.analysis = None
 
     # -- lifecycle ---------------------------------------------------------
     def _url(self) -> str:
-        opts = ";IFEXISTS=TRUE"
+        # ACCESS_MODE_DATA=r: H2 must never write to (and e.g. truncate) the copy;
+        # older 1.4 versions do this when they roll back to an old chunk.
+        opts = ";IFEXISTS=TRUE;ACCESS_MODE_DATA=r"
         if self.info.kind == "page":
             opts += ";MV_STORE=FALSE"
         if self.driver and not self.driver.v1:
             opts += ";LAZY_QUERY_EXECUTION=TRUE"
-        elif self.driver:
+        elif self.driver and _version_tuple(self.driver.version) >= (1, 4, 198):
             opts += ";LAZY_QUERY_EXECUTION=1"
         return f"jdbc:h2:file:{self.copy_base}{opts}{self.url_options}"
 
@@ -473,6 +483,14 @@ class Database:
                     raise RuntimeError("Kopie unvollständig (Datei wurde während des Kopierens verändert?)")
         else:
             self.copy_base = self.info.base
+        if self.info.kind == "mv":
+            try:
+                from .carve import analyze_mvstore
+                self.analysis = analyze_mvstore(self.copy_base + ext)
+                if self.analysis.rollback_suspected:
+                    progress(f"{self.label}: {self.analysis.text()}", None)
+            except Exception as e:  # noqa: BLE001
+                log.info("analysis failed: %s", e)
         progress(f"{self.label}: öffne Kopie mit H2 {self.driver.version} ...", None)
         self.conn = self.driver.connect(self._url(), self.user, self.password)
         self.conn.setAutoCommit(True)
@@ -540,8 +558,8 @@ class Database:
             dp["_RAW"] = {c.upper(): v for c, v in zip(cols, r)}
             self.datapoints.append(dp)
         for dp in self.datapoints:
-            name = historian_table_name(dp.get("INTERFACE", ""), dp.get("ADDRESS", ""),
-                                        dp.get("IDENTIFIER", ""))
+            name = dp.get("TABLE_NAME") or historian_table_name(
+                dp.get("INTERFACE", ""), dp.get("ADDRESS", ""), dp.get("IDENTIFIER", ""))
             dp["_TABLE"] = name if name in self.tables else None
             if dp["_TABLE"]:
                 self.tables[name].datapoint = dp

@@ -20,6 +20,14 @@ CCU-Historian-Datenbanken (H2, Dateien `*.mv.db` bzw. `*.h2.db`).
   sie enthält, automatisch aus dieser aufgefüllt.
 * Datenbanken, die sich gar nicht mehr öffnen lassen: **Recover** über
   `org.h2.tools.Recover` (auf einer Kopie) und Re-Import in eine neue Datei.
+* **Roh-Extraktion (Carving)** für H2-1.4-Dateien: liest alle noch
+  vorhandenen Datenseiten direkt (ohne B-Baum/Verwaltungsstrukturen) und
+  schreibt sie in eine neue Datenbank – auch wenn H2 die Datei nur noch in
+  einem uralten/leeren Stand öffnet.
+* **Rollback-Erkennung:** Enthält die Datei neuere Chunks als der
+  Store-Header, warnt das Tool (H2 würde sonst stillschweigend einen alten
+  Stand zeigen). Quellen werden zusätzlich schreibgeschützt geöffnet
+  (`ACCESS_MODE_DATA=r`), damit H2 die Arbeitskopie nicht abschneidet.
 * Migration 1.4 → 2.x möglich (Ziel-H2-Version frei wählbar).
 * Abschlussverifikation: Zeilenzahl je Tabelle in der neuen DB = Summe der
   übernommenen Werte. Bericht als `<ausgabe>_repair_report.txt` + `.json`.
@@ -94,6 +102,10 @@ python3 -m historian_repair recover /pfad/defekt.mv.db --jar jars/h2-1.4.200.jar
 ```
 
 ```bash
+python3 -m historian_repair carve /pfad/defekt.mv.db --jar jars/h2-1.4.200.jar
+```
+
+```bash
 python3 -m historian_repair merge --src aktuell.mv.db@jars/h2-2.3.232.jar --src backup.mv.db@jars/h2-1.4.200.jar --range B=2024-01-01..2024-06-30 --target-jar jars/h2-2.3.232.jar --out neu/history.mv.db
 ```
 
@@ -109,9 +121,9 @@ Lesefehlern/Warnungen.
 * JVM läuft mit `user.timezone=UTC`, dadurch werden `TIMESTAMP`-Werte 1:1
   (ohne Sommerzeit-Verschiebung) übertragen.
 * Datentabellen = Tabellen mit Spalten `TS` und `VALUE`. Zuordnung zu
-  `DATA_POINTS` über den Namen `D_<INTERFACE>_<ADRESSE>_<PARAMETER>`
-  (Großbuchstaben, Sonderzeichen → `_`). Nicht zuordenbare Tabellen werden
-  trotzdem angezeigt und übertragen.
+  `DATA_POINTS` über dessen Spalte `TABLE_NAME` (CCU-Historian), ersatzweise
+  über `D_<INTERFACE>_<ADRESSE>_<PARAMETER>`. Nicht zuordenbare Tabellen
+  werden trotzdem angezeigt und übertragen.
 * Schema: `SCRIPT NODATA` aus der Vorlage → `RUNSCRIPT` im Ziel
   (bei 1.x → 2.x mit `FROM_1X`). Zusätzliche Tabellen anderer Quellen werden
   ebenso angelegt (Index-/Constraint-Namen eindeutig umbenannt).
@@ -123,10 +135,27 @@ Lesefehlern/Warnungen.
   „Unlesbare Bereiche aufgeben ab [s]“ (Standard 600 s).
 * Durchsatz (gemessen, synthetisch): ca. 60 000–90 000 Werte/s.
 
-## Einschränkungen / offene Punkte
+## Roh-Extraktion (Carving) – Funktionsweise
 
-* Das Schema wurde anhand eines **nachgebauten** Historian-Schemas getestet;
-  die Prüfung mit einer echten CCU-Historian-Datenbank steht noch aus.
+1. Alle Chunk-Header an Blockgrenzen werden gesammelt; jeder wird per
+   Reflection als „letzter Chunk“ gesetzt, um seine Meta-Map (Map-ID → Name,
+   weitere Chunk-Positionen) zu lesen.
+2. Jeder Chunk-Bereich wird nach Seitenanfängen durchsucht (Prüfwert aus
+   Chunk-ID, Offset und Seitenlänge).
+3. Blattseiten der Tabellen werden mit H2s eigenen Klassen
+   (`ValueDataType`, `VersionedValueType`) dekodiert, auch komprimierte.
+4. Tabellendefinitionen stammen aus H2s interner Metatabelle (auch aus
+   Rohbytes). Tabellen ohne auffindbare Definition heißen `CARVED_T<id>`
+   bzw. `CARVED_MAP<id>` (Zuordnung zu Datenpunkten nicht sicher möglich →
+   bewusst keine Namensraterei).
+5. Mehrfach vorhandene Seitenversionen werden nach Zeilenschlüssel
+   dedupliziert (neueste Chunk-Version gewinnt).
+
+Benötigt `h2-1.4.200.jar`. Ergebnis: neue Datei im Arbeitsverzeichnis
+(`carve_*/carved.mv.db`) + `carve_report.txt`; sie wird automatisch als
+Quelle geöffnet und kann normal zusammengeführt werden.
+
+## Einschränkungen / offene Punkte
 * Recover (`org.h2.tools.Recover`) rettet nur, was H2 selbst noch lesen kann;
   völlig zerstörte Seiten sind verloren.
 * Ziel mit H2 1.x aus einer H2-2.x-Quelle wird abgelehnt (keine Rück-Migration).

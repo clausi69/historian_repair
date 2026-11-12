@@ -30,6 +30,9 @@ def _split_src(spec: str, default_jar: str | None) -> tuple[str, str]:
 def cmd_info(a) -> int:
     info = E.inspect_db_file(a.db)
     print(f"Datei:   {info.path}")
+    if info.kind == "mv":
+        from .carve import analyze_mvstore
+        print(f"Struktur: {analyze_mvstore(a.db).text()}")
     print(f"Größe:   {info.size / 1e6:.1f} MB")
     print(f"Format:  {info.format_text}  Header={info.header}")
     if info.lock_file:
@@ -65,6 +68,16 @@ def cmd_recover(a) -> int:
     wd = a.workdir or os.path.join(os.path.dirname(os.path.abspath(a.db)), "historian_repair_work")
     out = E.recover_database(a.db, a.jar, wd, a.user, a.password, _progress)
     print("Wiederhergestellte Datenbank:", out)
+    return 0
+
+
+def cmd_carve(a) -> int:
+    from . import carve as C
+    wd = a.workdir or os.path.join(os.path.dirname(os.path.abspath(a.db)), "historian_repair_work")
+    print(C.analyze_mvstore(a.db).text())
+    out, rep = C.carve_database(a.db, a.jar, wd, a.user, a.password, _progress)
+    print(rep.text())
+    print("Neue Datenbank mit geretteten Daten:", out)
     return 0
 
 
@@ -133,6 +146,12 @@ def main(argv=None) -> int:
     sp.add_argument("--jar", required=True)
     common(sp)
     sp.set_defaults(fn=cmd_recover)
+
+    sp = sub.add_parser("carve", help="Roh-Extraktion aller lesbaren Datenseiten (H2 1.4, braucht h2-1.4.200.jar)")
+    sp.add_argument("db")
+    sp.add_argument("--jar", required=True)
+    common(sp)
+    sp.set_defaults(fn=cmd_carve)
 
     sp = sub.add_parser("merge", help="Neue DB aus Quellen erzeugen (Reihenfolge = Priorität)")
     sp.add_argument("--src", action="append", required=True, help="PFAD[@JAR], mehrfach")

@@ -204,6 +204,7 @@ class SourceSlot:
         ttk.Button(bf, text="Öffnen", command=self.open).pack(side="left")
         ttk.Button(bf, text="Prüfen", command=self.deep_check).pack(side="left")
         ttk.Button(bf, text="Recover", command=self.recover).pack(side="left")
+        ttk.Button(bf, text="Carving", command=self.carve).pack(side="left")
         ttk.Button(bf, text="▲", width=2, command=lambda: self.app.move_slot(self, -1)).pack(side="left")
         ttk.Button(bf, text="▼", width=2, command=lambda: self.app.move_slot(self, 1)).pack(side="left")
         ttk.Button(bf, text="✕", width=2, command=lambda: self.app.remove_slot(self)).pack(side="left")
@@ -308,9 +309,16 @@ class SourceSlot:
             if nerr:
                 txt += f" | ⚠ {nerr} Tabellen mit Fehlern"
             if recovered_path:
-                txt += " | (via Recover)"
+                txt += " | (gerettete Kopie)"
             self.info.set(txt)
             self.app.log(f"{self.label} geöffnet: {txt}")
+            if getattr(db, "analysis", None) is not None and db.analysis.rollback_suspected and not recovered_path:
+                if messagebox.askyesno(
+                        "Verdacht auf Rollback",
+                        f"Quelle {self.label}: {db.analysis.text()}\n\nH2 zeigt dann nur einen alten "
+                        "Datenbankstand. Jetzt eine Roh-Extraktion (Carving) starten?"):
+                    self.carve()
+                    return
             unm = [d for d in db.datapoints if not d.get("_TABLE")]
             if unm:
                 self.app.log(f"{self.label}: {len(unm)} DATA_POINTS-Einträge ohne gefundene Datentabelle "
@@ -323,14 +331,20 @@ class SourceSlot:
             if isinstance(e, E.Cancelled):
                 return
             msg = E.java_error_text(e)
-            if not recovered_path and messagebox.askyesno(
-                    "Öffnen fehlgeschlagen",
-                    f"Quelle {self.label} konnte nicht geöffnet werden:\n\n{msg[:600]}\n\n"
-                    "Soll eine Rettung mit H2 Recover versucht werden?\n"
-                    "(Arbeitet auf einer Kopie, das Original bleibt unverändert.)"):
-                self.recover()
-            elif recovered_path:
+            if recovered_path:
                 messagebox.showerror("Fehler", msg[:1000])
+                return
+            ans = messagebox.askyesnocancel(
+                "Öffnen fehlgeschlagen",
+                f"Quelle {self.label} konnte nicht geöffnet werden:\n\n{msg[:600]}\n\n"
+                "Rettung versuchen? (arbeitet auf einer Kopie, Original bleibt unverändert)\n\n"
+                "Ja = Roh-Extraktion (Carving): liest alle noch vorhandenen Datenseiten direkt "
+                "(empfohlen für H2 1.4, benötigt h2-1.4.200.jar)\n"
+                "Nein = H2 Recover-Werkzeug\nAbbrechen = nichts tun")
+            if ans is True:
+                self.carve()
+            elif ans is False:
+                self.recover()
 
         w.submit(task, done, err, f"{self.label}: öffne {path}")
 
@@ -386,6 +400,36 @@ class SourceSlot:
                                                  f"mit unlesbaren Bereichen (rot markiert, Details im Protokoll).")
 
         w.submit(task, done, lambda e, tb: self.app.log(tb), f"{self.label}: Tiefenprüfung")
+
+    def carve(self):
+        if not self.path.get():
+            return
+        jar = next((p for d, p in self.app.jars.paths.items()
+                    if (self.app.jars.versions.get(p) or "").startswith("1.4.200")), None)
+        if jar is None:
+            messagebox.showwarning("Carving", "Für die Roh-Extraktion wird h2-1.4.200.jar benötigt "
+                                              "(Button 'H2 laden…').")
+            return
+        self.close()
+        workdir = self.app.workdir()
+        path, user, pw = self.path.get(), self.user.get(), self.password.get()
+        w = self.app.worker
+
+        def task():
+            from . import carve as C
+            return C.carve_database(path, jar, workdir, user, pw, w.progress, w.cancel)
+
+        def done(res):
+            out, rep = res
+            self.app.log(rep.text())
+            self.jar.set(self.app.jars.display_for(jar))
+            self.open(recovered_path=out, original=path)
+
+        def err(e, tb):
+            self.app.log(tb)
+            messagebox.showerror("Carving fehlgeschlagen", E.java_error_text(e)[:1000])
+
+        w.submit(task, done, err, f"{self.label}: Roh-Extraktion (Carving)")
 
     def close(self):
         if self.db is not None:

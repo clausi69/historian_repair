@@ -125,3 +125,26 @@ def test_damaged_source_filled_from_other(dbs):
         if t.is_data:
             assert tot[name] == t.count, name
     A2.close()
+
+
+def test_carve_intact_db(dbs):
+    from historian_repair import carve as C
+    d, a, _, _ = dbs
+    out, rep = C.carve_database(a, J14 if E.jar_version(J14).startswith("1.4.200") else J14, str(d / "work"))
+    A = _open("A", a, J14, str(d / "work"))
+    X = _open("X", out, J14, str(d / "work"))
+    for name, t in A.tables.items():
+        if t.is_data:
+            assert X.tables[name].count == t.count, name
+            assert (X.tables[name].min_ms, X.tables[name].max_ms) == (t.min_ms, t.max_ms)
+    assert len(X.datapoints) == len(A.datapoints)
+    A.close()
+    X.close()
+
+
+def test_rollback_detection(dbs):
+    from historian_repair import carve as C
+    _, a, _, _ = dbs
+    ana = C.analyze_mvstore(a)
+    assert not ana.rollback_suspected
+    assert ana.chunks
