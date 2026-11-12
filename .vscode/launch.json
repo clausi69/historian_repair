@@ -1,0 +1,45 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Historian Repair: GUI",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "historian_repair",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Historian Repair: info (Datei wählen)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "historian_repair",
+      "args": ["info", "${input:dbFile}", "--jar", "${input:jarFile}", "-v"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Tests (pytest)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["-q", "tests"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "dbFile",
+      "type": "promptString",
+      "description": "Pfad zur .mv.db oder .zip"
+    },
+    {
+      "id": "jarFile",
+      "type": "promptString",
+      "description": "H2-JAR",
+      "default": "jars/h2-2.5.252.jar"
+    }
+  ]
+}

@@ -65,6 +65,21 @@ python3 -m pip install -r requirements.txt
 python3 -m historian_repair
 ```
 
+### Visual Studio Code mit `.venv`
+
+```bash
+py -3 -m venv .venv
+```
+
+```bash
+.venv\Scripts\python -m pip install -r requirements.txt -r requirements-dev.txt
+```
+
+Danach den Ordner in VS Code öffnen (Python-Erweiterung von Microsoft
+installiert), Interpreter `.venv` wählen und im „Ausführen und Debuggen“-Bereich
+**„Historian Repair: GUI“** starten (F5). Linux/macOS: `python3 -m venv .venv`
+und `.venv/bin/python -m pip install …`.
+
 ## Ablauf (typischer Rettungsfall)
 
 1. **CCU-Historian stoppen** (bzw. Datenbankdatei vorher wegkopieren). Liegt

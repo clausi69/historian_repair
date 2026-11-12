@@ -5,3 +5,4 @@ historian_repair_work/
 *.trace.db
 *.lock.db
 .pytest_cache/
+.venv/
