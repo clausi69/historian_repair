@@ -1,0 +1,127 @@
+"""End-to-end tests with synthetic databases.
+
+Requires JPype, a Java runtime and H2 jars in ./jars (h2-1.4.200.jar and
+h2-2.3.232.jar); tests are skipped otherwise.
+Run: python -m pytest -q tests
+"""
+import os
+import shutil
+import sys
+import threading
+
+import pytest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from historian_repair import h2engine as E  # noqa: E402
+
+J14 = os.path.join(ROOT, "jars", "h2-1.4.200.jar")
+J23 = os.path.join(ROOT, "jars", "h2-2.3.232.jar")
+pytestmark = pytest.mark.skipif(not (os.path.exists(J14) and os.path.exists(J23)),
+                                reason="H2 jars not present in ./jars")
+
+
+@pytest.fixture(scope="module")
+def dbs(tmp_path_factory):
+    import make_testdb as M
+    E.start_jvm()
+    d = tmp_path_factory.mktemp("db")
+    a = str(d / "a" / "history")
+    b = str(d / "b" / "history")
+    os.makedirs(os.path.dirname(a))
+    os.makedirs(os.path.dirname(b))
+    M.create(a, J14, "2024-01-01", "2024-03-31 23:59:59", 600)
+    M.create(b, J23, "2024-03-01", "2024-05-31", 600, gap=("2024-04-01", "2024-04-05"),
+             extra_dp=("HmIP-RF", "000B:1", "LEVEL", "Rollladen", False))
+    # damaged copy of A
+    bad = str(d / "bad" / "history")
+    os.makedirs(os.path.dirname(bad))
+    shutil.copy(a + ".mv.db", bad + ".mv.db")
+    sz = os.path.getsize(bad + ".mv.db")
+    with open(bad + ".mv.db", "r+b") as f:
+        f.seek(int(sz * 0.35))
+        f.write(b"\xAA" * 3000)
+    return d, a + ".mv.db", b + ".mv.db", bad + ".mv.db"
+
+
+def _open(label, path, jar, wd):
+    db = E.Database(label, path, jar, workdir=wd)
+    db.open()
+    db.scan()
+    return db
+
+
+def _merge(d, srcs, out, dedup="timestamp", tjar=J23):
+    specs = [E.SourceSpec(db, None, lo, hi) for db, lo, hi in srcs]
+    opts = E.MergeOptions(output_path=str(d / out), target_jar=tjar, dedup=dedup, min_skip_ms=600_000,
+                          workdir=str(d / "work"), overwrite=True)
+    return E.MergeJob(specs, opts, cancel=threading.Event()).run()
+
+
+def test_format_detection(dbs):
+    _, a, b, _ = dbs
+    assert E.inspect_db_file(a).fmt == 1
+    assert E.inspect_db_file(b).fmt == 3
+
+
+def test_merge_timestamp(dbs):
+    d, a, b, _ = dbs
+    fa, fb = E.file_fingerprint(a), E.file_fingerprint(b)
+    A = _open("A", a, J14, str(d / "work"))
+    B = _open("B", b, J23, str(d / "work"))
+    rep = _merge(d, [(A, None, None), (B, None, None)], "m1.mv.db")
+    A.close()
+    B.close()
+    assert rep.ok, rep.text()
+    assert E.file_fingerprint(a) == fa and E.file_fingerprint(b) == fb
+    st = {(s.table, s.source): s for s in rep.stats}
+    t = "D_BIDCOS_RF_LEQ0000001_1_TEMPERATURE"
+    # March overlaps: 31 days * 144 values (plus boundary value on 2024-03-31 00:00..)
+    assert st[(t, "A")].inserted == st[(t, "A")].read
+    assert st[(t, "B")].dup > 0
+    assert st[(t, "B")].inserted + st[(t, "B")].dup == st[(t, "B")].read
+    assert ("D_HMIP_RF_000B_1_LEVEL", "B") in st
+    for exp, got in rep.verify.values():
+        assert exp == got
+
+
+def test_merge_range_and_window(dbs):
+    d, a, b, _ = dbs
+    A = _open("A", a, J14, str(d / "work"))
+    B = _open("B", b, J23, str(d / "work"))
+    lo = E.str_to_ms("2024-02-01")
+    hi = E.str_to_ms("2024-02-15 23:59:59")
+    rep = _merge(d, [(A, lo, hi), (B, None, None)], "m2.mv.db", dedup="range")
+    A.close()
+    B.close()
+    st = {(s.table, s.source): s for s in rep.stats}
+    t = "D_BIDCOS_RF_LEQ0000001_1_TEMPERATURE"
+    assert st[(t, "A")].min_ms >= lo and st[(t, "A")].max_ms <= hi
+    assert st[(t, "A")].inserted == 15 * 144
+    assert st[(t, "B")].range_skip == 0  # B starts after A's window
+    assert rep.ok
+
+
+def test_damaged_source_filled_from_other(dbs):
+    d, a, b, bad = dbs
+    X = _open("X", bad, J14, str(d / "work"))
+    A = _open("A", a, J14, str(d / "work"))
+    rep = _merge(d, [(X, None, None), (A, None, None)], "m3.mv.db", tjar=J14)
+    X.close()
+    A.close()
+    lost = [s for s in rep.stats if s.lost]
+    assert lost, "expected unreadable ranges in damaged copy"
+    # all values must be present in the result thanks to A
+    for s in rep.stats:
+        if s.source == "A":
+            assert s.inserted + s.dup == s.read
+    tot = {}
+    for s in rep.stats:
+        tot[s.table] = tot.get(s.table, 0) + s.inserted
+    A2 = _open("A2", a, J14, str(d / "work"))
+    for name, t in A2.tables.items():
+        if t.is_data:
+            assert tot[name] == t.count, name
+    A2.close()

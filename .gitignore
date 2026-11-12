@@ -1,0 +1,7 @@
+jars/*.jar
+__pycache__/
+*.pyc
+historian_repair_work/
+*.trace.db
+*.lock.db
+.pytest_cache/
