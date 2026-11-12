@@ -129,7 +129,8 @@ Lesefehlern/Warnungen.
   geladen → mehrere H2-Versionen parallel.
 * JVM läuft mit `user.timezone=UTC`, dadurch werden `TIMESTAMP`-Werte 1:1
   (ohne Sommerzeit-Verschiebung) übertragen.
-* Datentabellen = Tabellen mit Spalten `TS` und `VALUE`. Zuordnung zu
+* Datentabellen = Tabellen mit Spalten `TS` und `VALUE` (CCU-Historian: `D_…` numerisch,
+  `C_…` Text-Datenpunkte mit `VALUE VARCHAR`). Zuordnung zu
   `DATA_POINTS` über dessen Spalte `TABLE_NAME` (CCU-Historian), ersatzweise
   über `D_<INTERFACE>_<ADRESSE>_<PARAMETER>`. Nicht zuordenbare Tabellen
   werden trotzdem angezeigt und übertragen.
