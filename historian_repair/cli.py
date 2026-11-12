@@ -134,7 +134,7 @@ def cmd_merge(a) -> int:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="historian_repair",
                                 description="CCU-Historian H2-Datenbanken analysieren, retten und zusammenführen")
-    p.add_argument("--jvm", help="Pfad zur jvm.dll / libjvm.so (optional)")
+    p.add_argument("--jvm", help="Java: Pfad zur jvm.dll/libjvm.so oder Java-Verzeichnis (optional, sonst automatisch)")
     p.add_argument("--xmx", help="max. Java-Heap, z.B. 2g")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -180,7 +180,12 @@ def main(argv=None) -> int:
 
     a = p.parse_args(argv)
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
-    E.start_jvm(a.jvm, a.xmx)
+    try:
+        j = E.start_jvm(a.jvm, a.xmx)
+    except RuntimeError as e:
+        print(f"FEHLER: {e}")
+        return 3
+    print(f"Verwende {j.text()}")
     t0 = time.time()
     rc = a.fn(a)
     print(f"({time.time() - t0:.1f} s)")

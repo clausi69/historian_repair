@@ -227,24 +227,165 @@ def file_fingerprint(path: str) -> tuple[int, int]:
 _jvm_lock = threading.Lock()
 
 
-def start_jvm(jvm_path: Optional[str] = None, max_heap: Optional[str] = None) -> None:
+MIN_JAVA = 11   # H2 2.3+ needs Java 11, JPype >= 1.5 needs Java 9
+JAVA_DOWNLOAD_HINT = ("Bitte zusätzlich Java 21 (LTS, 64 Bit) installieren, z.B. Eclipse Temurin von "
+                      "https://adoptium.net – eine vorhandene Java-8-Installation kann bleiben, das Tool "
+                      "findet die neue Version selbst.")
+_started_jvm: dict = {}
+
+
+@dataclass
+class JavaInstall:
+    jvm: str                 # path to jvm.dll / libjvm.so / libjvm.dylib
+    home: str
+    version: str             # e.g. "21.0.5" or "1.8.0_511"
+    major: int               # 8, 11, 17, 21, ...
+
+    def text(self) -> str:
+        return f"Java {self.major} ({self.version}) – {self.home}"
+
+
+def _java_major(version: str) -> int:
+    m = re.match(r"(\d+)(?:\.(\d+))?", version or "")
+    if not m:
+        return 0
+    a = int(m.group(1))
+    return int(m.group(2) or 0) if a == 1 else a      # "1.8.0_511" -> 8
+
+
+def _java_home_of(jvm: str) -> str:
+    """First ancestor directory of the JVM library that contains bin/java(.exe)."""
+    exe = "java.exe" if os.name == "nt" else "java"
+    d = os.path.dirname(os.path.realpath(jvm))
+    for _ in range(6):
+        if os.path.isfile(os.path.join(d, "bin", exe)):
+            return d
+        nd = os.path.dirname(d)
+        if nd == d:
+            break
+        d = nd
+    return os.path.dirname(os.path.dirname(os.path.realpath(jvm)))
+
+
+def java_version_of(jvm: str) -> Optional[str]:
+    """Version of the Java installation that contains this JVM library."""
+    import subprocess
+    home = _java_home_of(jvm)
+    for cand in (home, os.path.dirname(home)):
+        rel = os.path.join(cand, "release")
+        if os.path.isfile(rel):
+            with open(rel, encoding="utf-8", errors="replace") as f:
+                m = re.search(r'JAVA_VERSION="([^"]+)"', f.read())
+            if m:
+                return m.group(1)
+    exe = "java.exe" if os.name == "nt" else "java"
+    for cand in (os.path.join(home, "bin", exe), os.path.join(home, "jre", "bin", exe),
+                 os.path.join(os.path.dirname(home), "bin", exe)):
+        if os.path.isfile(cand):
+            try:
+                kw = {"creationflags": 0x08000000} if os.name == "nt" else {}   # CREATE_NO_WINDOW
+                r = subprocess.run([cand, "-version"], capture_output=True, text=True, timeout=20, **kw)
+                m = re.search(r'version "([^"]+)"', r.stderr + r.stdout)
+                if m:
+                    return m.group(1)
+            except (OSError, subprocess.SubprocessError):
+                pass
+    return None
+
+
+def _jvm_candidates() -> list[str]:
+    import glob
+    pats: list[str] = []
+    homes = [os.environ.get("JAVA_HOME"), os.environ.get("JDK_HOME"), os.environ.get("JRE_HOME")]
+    for h in homes:
+        if h:
+            pats += [os.path.join(h, "bin", "server", "jvm.dll"), os.path.join(h, "jre", "bin", "server", "jvm.dll"),
+                     os.path.join(h, "lib", "server", "libjvm.so"), os.path.join(h, "jre", "lib", "*", "server", "libjvm.so"),
+                     os.path.join(h, "lib", "server", "libjvm.dylib")]
+    if os.name == "nt":
+        roots = [os.environ.get(v) for v in ("ProgramFiles", "ProgramW6432", "LOCALAPPDATA")]
+        for r in filter(None, roots):
+            for vendor in ("Eclipse Adoptium", "Eclipse Foundation", "Java", "Microsoft", "Zulu", "Amazon Corretto",
+                           "BellSoft", "OpenJDK", "AdoptOpenJDK", "Semeru", "Programs\\Eclipse Adoptium"):
+                pats += [os.path.join(r, vendor, "*", "bin", "server", "jvm.dll"),
+                         os.path.join(r, vendor, "*", "jre", "bin", "server", "jvm.dll")]
+    else:
+        pats += ["/usr/lib/jvm/*/lib/server/libjvm.so", "/usr/lib/jvm/*/jre/lib/*/server/libjvm.so",
+                 "/usr/java/*/lib/server/libjvm.so", "/opt/*/lib/server/libjvm.so",
+                 "/Library/Java/JavaVirtualMachines/*/Contents/Home/lib/server/libjvm.dylib",
+                 os.path.expanduser("~/Library/Java/JavaVirtualMachines/*/Contents/Home/lib/server/libjvm.dylib")]
+    out: list[str] = []
+    for p in pats:
+        for f in glob.glob(p):
+            f = os.path.realpath(f)
+            if f not in out:
+                out.append(f)
+    try:
+        import jpype
+        d = os.path.realpath(jpype.getDefaultJVMPath())
+        if d not in out:
+            out.append(d)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def find_java_installs() -> list[JavaInstall]:
+    res = []
+    for jvm in _jvm_candidates():
+        v = java_version_of(jvm)
+        res.append(JavaInstall(jvm, _java_home_of(jvm), v or "unbekannt", _java_major(v or "")))
+    res.sort(key=lambda j: j.major, reverse=True)
+    return res
+
+
+def choose_jvm(jvm_path: Optional[str] = None) -> JavaInstall:
+    """Explicit path (checked) or the newest installed Java >= MIN_JAVA."""
+    if jvm_path:
+        p = jvm_path
+        if os.path.isdir(p):      # a Java home directory was given
+            found = [j for j in find_java_installs() if os.path.realpath(j.home).startswith(os.path.realpath(p))]
+            if not found:
+                raise RuntimeError(f"Im Verzeichnis {p} wurde keine jvm.dll/libjvm.so gefunden.")
+            j = found[0]
+        else:
+            v = java_version_of(p) or "unbekannt"
+            j = JavaInstall(os.path.realpath(p), _java_home_of(p), v, _java_major(v))
+        if 0 < j.major < MIN_JAVA:
+            raise RuntimeError(f"Die eingestellte {j.text()} ist zu alt; benötigt wird Java {MIN_JAVA} "
+                               f"oder neuer.\n{JAVA_DOWNLOAD_HINT}")
+        return j
+    installs = find_java_installs()
+    ok = [j for j in installs if j.major >= MIN_JAVA]
+    if ok:
+        return ok[0]
+    unknown = [j for j in installs if j.major == 0]
+    if unknown:
+        return unknown[0]
+    if installs:
+        raise RuntimeError("Gefundene Java-Versionen sind zu alt (benötigt Java "
+                           f"{MIN_JAVA} oder neuer):\n  " + "\n  ".join(j.text() for j in installs)
+                           + f"\n\nHinweis: Nach Java 8 (\"1.8\") kamen Java 9, 10, 11 … 25.\n{JAVA_DOWNLOAD_HINT}")
+    raise RuntimeError(f"Keine Java-Installation gefunden.\n{JAVA_DOWNLOAD_HINT}")
+
+
+def start_jvm(jvm_path: Optional[str] = None, max_heap: Optional[str] = None) -> JavaInstall:
     import jpype
     with _jvm_lock:
         if jpype.isJVMStarted():
-            return
+            return _started_jvm.get("java")
+        j = choose_jvm(jvm_path)
         args = ["-Duser.timezone=UTC", "-Dfile.encoding=UTF-8"]
         if max_heap:
             args.append(f"-Xmx{max_heap}")
-        path = jvm_path or None
-        if path is None:
-            try:
-                path = jpype.getDefaultJVMPath()
-            except Exception as e:  # noqa: BLE001
-                raise RuntimeError(
-                    "Keine Java-Laufzeit gefunden. Bitte Java 11 oder neuer installieren "
-                    "(z.B. Eclipse Temurin) oder JAVA_HOME setzen bzw. den Pfad zur "
-                    "jvm.dll/libjvm.so in den Einstellungen angeben.\n" + str(e)) from e
-        jpype.startJVM(path, *args, convertStrings=True)
+        try:
+            jpype.startJVM(j.jvm, *args, convertStrings=True)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"Java konnte nicht gestartet werden: {j.text()}\n{e}\n"
+                               "Python und Java müssen beide 64 Bit sein.") from e
+        _started_jvm["java"] = j
+        log.info("JVM: %s", j.text())
+        return j
 
 
 def java_error_text(e: BaseException) -> str:
@@ -280,7 +421,11 @@ class H2Driver:
         File = jpype.JClass("java.io.File")
         ClassLoader = jpype.JClass("java.lang.ClassLoader")
         Class = jpype.JClass("java.lang.Class")
-        self.loader = URLClassLoader([File(self.jar).toURI().toURL()], ClassLoader.getPlatformClassLoader())
+        try:
+            parent = ClassLoader.getPlatformClassLoader()          # Java 9+
+        except AttributeError:
+            parent = ClassLoader.getSystemClassLoader().getParent()  # Java 8: extension loader
+        self.loader = URLClassLoader([File(self.jar).toURI().toURL()], parent)
         self._Class = Class
         drv_cls = Class.forName("org.h2.Driver", True, self.loader)
         self.driver = drv_cls.getDeclaredConstructor().newInstance()

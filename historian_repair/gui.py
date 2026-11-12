@@ -522,7 +522,7 @@ class App:
         ttk.Label(top, text="Arbeitsverzeichnis (Kopien):").pack(side="left")
         ttk.Entry(top, textvariable=self.workdir_var, width=45).pack(side="left", padx=2)
         ttk.Button(top, text="…", width=3, command=self._browse_workdir).pack(side="left")
-        ttk.Label(top, text="  JVM (optional):").pack(side="left")
+        ttk.Label(top, text="  Java (optional, sonst automatisch):").pack(side="left")
         ttk.Entry(top, textvariable=self.jvm_var, width=30).pack(side="left", padx=2)
         ttk.Button(top, text="JAR hinzufügen…", command=self._add_jar).pack(side="left", padx=(10, 2))
         ttk.Button(top, text="H2 laden…", command=self._download_jar).pack(side="left", padx=2)
@@ -669,11 +669,15 @@ class App:
         return wd
 
     def _ensure_jvm(self):
+        import jpype
+        first = not jpype.isJVMStarted()
         try:
-            E.start_jvm(self.jvm_var.get().strip() or None)
+            j = E.start_jvm(self.jvm_var.get().strip() or None)
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("Java", str(e))
             raise
+        if first and j is not None:
+            self.log(f"Verwende {j.text()}")
 
     def _browse_workdir(self):
         d = filedialog.askdirectory(initialdir=self.workdir_var.get())

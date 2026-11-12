@@ -12,15 +12,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-where java >nul 2>nul
-if errorlevel 1 (
-  if not defined JAVA_HOME (
-    echo Java wurde nicht gefunden. Bitte Java 11 oder neuer installieren, z.B. Eclipse Temurin
-    echo von https://adoptium.net ^(im Installer "Set JAVA_HOME variable" aktivieren^).
-    pause
-    exit /b 1
-  )
-)
+rem Java (11 or newer) is located by the tool itself, also without PATH/JAVA_HOME.
 
 py -3 -c "import jpype, numpy" 2>nul
 if errorlevel 1 (

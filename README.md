@@ -42,7 +42,7 @@ CCU-Historian-Datenbanken (H2, Dateien `*.mv.db` bzw. `*.h2.db`).
 | Komponente | Version |
 |---|---|
 | Python | ≥ 3.9 mit Tkinter (unter Windows im Standard-Installer enthalten; Linux: Paket `python3-tk`) |
-| Java (JRE/JDK) | ≥ 11 (für H2 2.x), z. B. Eclipse Temurin. `JAVA_HOME` setzen oder JVM-Pfad in der Oberfläche angeben |
+| Java (JRE/JDK) | **≥ 11, empfohlen 21 LTS, 64 Bit** (z. B. Eclipse Temurin, https://adoptium.net). Java 8 („1.8.0_…“) reicht nicht (JPype braucht ≥ 9, H2 2.3–2.5 ≥ 11), kann aber parallel installiert bleiben: Das Tool sucht alle installierten Java-Versionen (JAVA_HOME, Program Files, /usr/lib/jvm …) und nimmt die neueste ≥ 11. Optional Pfad/Verzeichnis im Feld „Java“ bzw. `--jvm` |
 | Python-Paket | `JPype1` (`pip install -r requirements.txt`) |
 | H2-Treiber | passende `h2-<version>.jar` – Button **„H2 laden…“** lädt sie von Maven Central nach `jars/`; alternativ **„JAR hinzufügen…“** (z. B. das JAR aus der eigenen CCU-Historian-Installation) |
 
