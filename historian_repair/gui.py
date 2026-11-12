@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import queue
 import string
 import threading
@@ -14,6 +15,7 @@ from typing import Callable, Optional
 
 from . import __version__
 from . import h2engine as E
+from . import secret
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 JAR_DIR = os.path.join(APP_DIR, "jars")
@@ -34,15 +36,15 @@ class Worker:
         self.cancel = threading.Event()
         self.busy = False
         self.on_busy: Callable[[bool], None] = lambda b: None
-        self.on_progress: Callable[[str, Optional[float]], None] = lambda m, f: None
+        self.on_progress: Callable[..., None] = lambda m, f, d=False: None
         threading.Thread(target=self._loop, daemon=True).start()
         root.after(100, self._poll)
 
     def submit(self, fn, on_done=None, on_error=None, title=""):
         self.tasks.put((fn, on_done, on_error, title))
 
-    def progress(self, msg: str, frac: Optional[float] = None) -> None:
-        self.events.put(("progress", msg, frac))
+    def progress(self, msg: str, frac: Optional[float] = None, detail: bool = False) -> None:
+        self.events.put(("progress", msg, frac, detail))
 
     def _loop(self):
         while True:
@@ -64,7 +66,7 @@ class Worker:
                 ev = self.events.get_nowait()
                 kind = ev[0]
                 if kind == "progress":
-                    self.on_progress(ev[1], ev[2])
+                    self.on_progress(ev[1], ev[2], ev[3])
                 elif kind == "busy":
                     self.busy = ev[1]
                     self.on_busy(ev[1])
@@ -239,6 +241,7 @@ class SourceSlot:
         self.app.settings["last_dir"] = os.path.dirname(p)
         self.path.set(p)
         self.inspect_file()
+        self.app.save()
 
     def inspect_file(self):
         if self.path.get().lower().endswith(".zip"):
@@ -343,6 +346,7 @@ class SourceSlot:
                 txt += " | (aus ZIP-Backup)"
             self.info.set(txt)
             self.app.log(f"{self.label} geöffnet: {txt}")
+            self.app.save()
             if getattr(db, "analysis", None) is not None and db.analysis.rollback_suspected and not recovered_path:
                 if messagebox.askyesno(
                         "Verdacht auf Rollback",
@@ -460,7 +464,7 @@ class SourceSlot:
 
         def done(res):
             out, rep = res
-            self.app.log(rep.text())
+            self.app.log(rep.text(max_tables=10))
             self.jar.set(self.app.jars.display_for(jar))
             self.open(recovered_path=out, original=path)
 
@@ -508,12 +512,13 @@ class App:
         self.workdir_var = tk.StringVar(value=self.settings.get(
             "workdir", os.path.join(os.path.expanduser("~"), "historian_repair_work")))
         self.jvm_var = tk.StringVar(value=self.settings.get("jvm", ""))
+        self.save_pw = tk.BooleanVar(value=self.settings.get("save_passwords", True))
         self.sel_slot = tk.StringVar(value="A")
         self.current_table: Optional[str] = None
         self._build()
-        self.add_slot()
-        self.add_slot()
+        self._restore()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.after(15000, self._autosave)
 
     # -- layout ------------------------------------------------------------
     def _build(self):
@@ -527,6 +532,9 @@ class App:
         ttk.Button(top, text="JAR hinzufügen…", command=self._add_jar).pack(side="left", padx=(10, 2))
         ttk.Button(top, text="H2 laden…", command=self._download_jar).pack(side="left", padx=2)
         ttk.Button(top, text="+ Quelle", command=self.add_slot).pack(side="right")
+        ttk.Button(top, text="Alle öffnen", command=self.open_all).pack(side="right", padx=4)
+        ttk.Checkbutton(top, text="Passwörter merken", variable=self.save_pw,
+                        command=self._pw_hint).pack(side="right", padx=8)
 
         self.slot_area = ttk.LabelFrame(self.root, text="Quell-Datenbanken (Reihenfolge = Priorität, "
                                                         "oben = höchste)", padding=4)
@@ -592,6 +600,7 @@ class App:
         nb.add(t3, text="Protokoll")
         self.logbox = ScrolledText(t3, height=10, font=("Courier", 9))
         self.logbox.pack(fill="both", expand=True)
+        self.logbox.tag_configure("warn", foreground="#b00000")
 
         # -- target
         tg = ttk.LabelFrame(pw, text="Neue Datenbank (Ziel)", padding=6)
@@ -639,15 +648,21 @@ class App:
 
     # -- helpers -----------------------------------------------------------
     def log(self, msg: str):
-        self.logbox.insert("end", msg.rstrip() + "\n")
+        ts = time.strftime("%H:%M:%S")
+        lines = msg.rstrip().splitlines() or [""]
+        text = "\n".join([f"{ts}  {lines[0]}"] + [f"          {x}" for x in lines[1:]])
+        tag = ("warn",) if any(k in msg for k in ("WARNUNG", "FEHLER", "Fehler", "unlesbar", "NICHT LESBAR")) else ()
+        self.logbox.insert("end", text + "\n", tag)
         self.logbox.see("end")
 
-    def _on_progress(self, msg: str, frac: Optional[float]):
+    def _on_progress(self, msg: str, frac: Optional[float], detail: bool = False):
+        # frequent updates (detail) only in the status line, milestones also in the log
         self.status.set(msg)
         if frac is not None:
+            self.pbar.stop()
             self.pbar.configure(mode="determinate")
             self.pbar["value"] = frac
-        if not msg.startswith("[") and "analysiere" not in msg:
+        if not detail:
             self.log(msg)
 
     def _on_busy(self, busy: bool):
@@ -683,6 +698,7 @@ class App:
         d = filedialog.askdirectory(initialdir=self.workdir_var.get())
         if d:
             self.workdir_var.set(d)
+            self.save()
 
     def _browse_out(self):
         p = filedialog.asksaveasfilename(title="Neue Datenbank speichern als", defaultextension=".mv.db",
@@ -760,6 +776,7 @@ class App:
         self.slots.remove(s)
         self._layout_slots()
         self.refresh_tree()
+        self.save()
 
     def move_slot(self, s: SourceSlot, d: int):
         i = self.slots.index(s)
@@ -768,6 +785,7 @@ class App:
             self.slots[i], self.slots[j] = self.slots[j], self.slots[i]
             self._layout_slots()
             self.refresh_tree()
+            self.save()
 
     def _layout_slots(self):
         for s in self.slots:
@@ -1149,7 +1167,7 @@ class App:
                 return
             opts.overwrite = True
         self.settings["out_path"] = self.out_path.get()
-        save_settings(self._settings_dict())
+        self.save()
         w = self.worker
 
         def task():
@@ -1161,7 +1179,7 @@ class App:
 
         def done(res):
             rep, rpath = res
-            self.log(rep.text())
+            self.log(rep.summary())
             self.log(f"Bericht gespeichert: {rpath}")
             self.nb.select(2)
             if rep.ok:
@@ -1183,14 +1201,89 @@ class App:
     # -- close -------------------------------------------------------------
     def _settings_dict(self) -> dict:
         s = dict(self.settings)
+        sources = []
+        for sl in self.slots:
+            sources.append({
+                "path": sl.path.get(), "jar": self.jars.paths.get(sl.jar.get(), ""), "user": sl.user.get(),
+                "password": secret.protect(sl.password.get()) if self.save_pw.get() else "",
+                "active": sl.active.get(), "t_from": sl.t_from.get(), "t_to": sl.t_to.get()})
+        labels = [sl.label for sl in self.slots]
         s.update({"jars": self.jars.extra, "workdir": self.workdir_var.get(), "jvm": self.jvm_var.get(),
-                  "out_path": self.out_path.get()})
+                  "out_path": self.out_path.get(), "save_passwords": self.save_pw.get(), "sources": sources,
+                  "target_jar": self.jars.paths.get(self.target_jar.get(), ""),
+                  "template_index": labels.index(self.template.get()) if self.template.get() in labels else 0,
+                  "dedup": self.dedup.get(), "min_skip": self.min_skip.get(), "compact": self.compact.get(),
+                  "keep_work": self.keep_work.get()})
         return s
+
+    def save(self):
+        save_settings(self._settings_dict())
+
+    def _autosave(self):
+        self.save()
+        self.root.after(15000, self._autosave)
+
+    def _pw_hint(self):
+        if self.save_pw.get():
+            self.log(f"Passwörter werden gespeichert ({secret.protection_text()}) in {SETTINGS_FILE}")
+        else:
+            self.log("Passwörter werden nicht mehr gespeichert.")
+        self.save()
+
+    def _jar_display(self, path: str) -> str:
+        if not path:
+            return ""
+        d = self.jars.display_for(path)
+        if not d and os.path.isfile(path):
+            d = self.jars.add(path) or ""
+            self._refresh_jar_lists()
+        return d
+
+    def _restore(self):
+        st = self.settings
+        sources = st.get("sources") or []
+        for src in sources:
+            self.add_slot()
+            sl = self.slots[-1]
+            sl.path.set(src.get("path", ""))
+            sl.jar.set(self._jar_display(src.get("jar", "")))
+            sl.user.set(src.get("user", "sa"))
+            sl.password.set(secret.unprotect(src.get("password", "")))
+            sl.active.set(bool(src.get("active", True)))
+            sl.t_from.set(src.get("t_from", ""))
+            sl.t_to.set(src.get("t_to", ""))
+            p = sl.path.get()
+            if p:
+                sl.info.set("zuletzt verwendet – 'Öffnen' bzw. 'Alle öffnen'" if os.path.exists(p)
+                            else "⚠ Datei nicht gefunden")
+        while len(self.slots) < 2:
+            self.add_slot()
+        tj = self._jar_display(st.get("target_jar", ""))
+        if tj:
+            self.target_jar.set(tj)
+        ti = st.get("template_index", 0)
+        if 0 <= ti < len(self.slots):
+            self.template.set(self.slots[ti].label)
+        self.dedup.set(st.get("dedup", "timestamp"))
+        self.min_skip.set(st.get("min_skip", "600"))
+        self.compact.set(st.get("compact", True))
+        self.keep_work.set(st.get("keep_work", False))
+        if sources:
+            self.log(f"Einstellungen geladen: {sum(1 for x in sources if x.get('path'))} Quelle(n), "
+                     f"Arbeitsverzeichnis {self.workdir_var.get()}")
+
+    def open_all(self):
+        todo = [sl for sl in self.slots if sl.path.get() and sl.db is None]
+        if not todo:
+            messagebox.showinfo("Öffnen", "Keine (noch nicht geöffneten) Quellen mit Dateipfad.")
+            return
+        for sl in todo:
+            sl.open()
 
     def on_close(self):
         if self.worker.busy and not messagebox.askyesno("Beenden", "Ein Vorgang läuft noch. Trotzdem beenden?"):
             return
-        save_settings(self._settings_dict())
+        self.save()
         for s in self.slots:
             if s.db:
                 try:

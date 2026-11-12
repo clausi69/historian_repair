@@ -127,17 +127,22 @@ class CarveReport:
     unnamed_tables: list = field(default_factory=list)
     debug: dict = field(default_factory=dict)
 
-    def text(self) -> str:
+    def text(self, max_tables: Optional[int] = None) -> str:
         L = [f"Carving-Ergebnis: {self.output}",
              f"Maps bekannt: {self.maps_known}, Seiten gefunden: {self.pages_found}, "
              f"Tabellen-Blattseiten dekodiert: {self.pages_decoded}, fehlgeschlagen: {self.pages_failed}",
              f"Tabellen mit Daten: {len(self.tables)}, Zeilen gesamt: "
              f"{sum(v[0] for v in self.tables.values())}"]
-        for n, (cnt, a, b) in sorted(self.tables.items()):
+        items = sorted(self.tables.items(), key=lambda x: -x[1][0])
+        shown = items if max_tables is None else items[:max_tables]
+        if max_tables is not None and len(items) > max_tables:
+            L.append(f"  größte {max_tables} Tabellen (alle in carve_report.txt):")
+        for n, (cnt, a, b) in shown:
             L.append(f"  {n:55s} {cnt:8d}  {E.ms_to_str(a)} .. {E.ms_to_str(b)}")
         if self.unnamed_tables:
-            L.append("Tabellen ohne gefundene Definition (als CARVED_* angelegt): "
-                     + ", ".join(self.unnamed_tables))
+            u = self.unnamed_tables
+            L.append(f"{len(u)} Tabellen ohne gefundene Definition (als CARVED_* angelegt): "
+                     + ", ".join(u[:8]) + (f", … (+{len(u) - 8})" if len(u) > 8 else ""))
         if self.statements_failed:
             L.append("Nicht ausführbare DDL-Anweisungen:")
             L += [f"  {s}" for s in self.statements_failed[:30]]
@@ -188,8 +193,8 @@ def carve_database(file_path: str, jar: str, workdir: str, user: str = "sa", pas
 
     rdir = E.unique_dir(workdir, "carve")
     src = os.path.join(rdir, "source_copy.mv.db")
-    progress(f"Carving: kopiere {file_path} ...", None)
-    shutil.copyfile(info.path, src)
+    progress(f"Carving: kopiere {file_path} ({E.fmt_mb(info.size)})", None)
+    E.copy_with_progress(info.path, src, progress, "Carving: kopiere", cancel)
     rep = CarveReport()
 
     # -- 1. chunks + meta ----------------------------------------------------
@@ -272,7 +277,9 @@ def carve_database(file_path: str, jar: str, workdir: str, user: str = "sa", pas
     for i, (fp, (off, plen, ver)) in enumerate(items):
         if i % 2000 == 0:
             E._check_cancel(cancel)
-            progress(f"Carving: Seite {i}/{len(items)}", 0.2 + 0.5 * i / max(1, len(items)))
+            progress(f"Carving: dekodiere Seite {E.fmt_n(i)} von {E.fmt_n(len(items))}, "
+                     f"{E.fmt_n(sum(len(r) for r in rows.values()))} Zeilen gefunden",
+                     0.2 + 0.5 * i / max(1, len(items)), True)
         buf = ByteBuffer.wrap(jdata, fp, plen)
         buf.getInt()
         buf.getShort()
@@ -415,7 +422,11 @@ def carve_database(file_path: str, jar: str, workdir: str, user: str = "sa", pas
                     except Exception as e:  # noqa: BLE001
                         rep.statements_failed.append(f"{sql[:120]} -> {E.java_error_text(e)[:120]}")
             groups.setdefault(tname, []).append(r)
-        for tname, parts in sorted(groups.items()):
+        n_groups = len(groups)
+        total_rows = sum(len(r) for parts in groups.values() for r in parts)
+        written = 0
+        progress(f"Carving: schreibe {n_groups} Tabellen mit bis zu {E.fmt_n(total_rows)} Werten", 0.75)
+        for gi, (tname, parts) in enumerate(sorted(groups.items())):
             E._check_cancel(cancel)
             r = _merge_parts(parts)
             if tname not in _existing_tables(conn):
@@ -438,8 +449,15 @@ def carve_database(file_path: str, jar: str, workdir: str, user: str = "sa", pas
                     cnt += 1
                     if cnt % 5000 == 0:
                         ps.executeBatch()
+                        progress(f"Carving: schreibe Tabelle {gi + 1}/{n_groups} ({tname}), "
+                                 f"{E.fmt_n(written + cnt)} von {E.fmt_n(total_rows)} Werten geschrieben",
+                                 0.75 + 0.2 * (written + cnt) / max(1, total_rows), True)
                 ps.executeBatch()
                 conn.commit()
+                written += cnt
+                progress(f"Carving: schreibe Tabelle {gi + 1}/{n_groups} ({tname}), "
+                         f"{E.fmt_n(written)} von {E.fmt_n(total_rows)} Werten geschrieben",
+                         0.75 + 0.2 * written / max(1, total_rows), True)
             except Exception as e:  # noqa: BLE001
                 conn.rollback()
                 rep.statements_failed.append(f"INSERT {tname}: {E.java_error_text(e)[:150]}")
@@ -456,7 +474,9 @@ def carve_database(file_path: str, jar: str, workdir: str, user: str = "sa", pas
                     pass
                 rep.tables[tname] = (cnt, mn, mx)
         conn.setAutoCommit(True)
-        E.execute(conn, "SHUTDOWN COMPACT")
+        progress(f"Carving: {E.fmt_n(written)} Werte geschrieben, kompaktiere ...", 0.95)
+        with E.Ticker(progress, "Carving: kompaktiere neue Datenbank", rdir):
+            E.execute(conn, "SHUTDOWN COMPACT")
     finally:
         try:
             conn.close()
@@ -466,7 +486,8 @@ def carve_database(file_path: str, jar: str, workdir: str, user: str = "sa", pas
     rep.output = newbase + ".mv.db"
     with open(os.path.join(rdir, "carve_report.txt"), "w", encoding="utf-8") as f:
         f.write(rep.text() + "\n")
-    progress("Carving: fertig", 1.0)
+    progress(f"Carving: fertig – {len(rep.tables)} Tabellen, {E.fmt_n(sum(v[0] for v in rep.tables.values()))} "
+             f"Werte gerettet", 1.0)
     return rep.output, rep
 
 

@@ -560,11 +560,96 @@ class TableInfo:
         return str(dp.get("DISPLAY_NAME") or "") or self.name
 
 
-ProgressCb = Callable[[str, Optional[float]], None]
+# progress(msg, frac=None, detail=False)
+#   frac:   0..1 for the progress bar, None = unchanged/unknown
+#   detail: True = frequent status update (status line only, not written to the log)
+ProgressCb = Callable[..., None]
 
 
-def _noop_progress(msg: str, frac: Optional[float] = None) -> None:
+def _noop_progress(msg: str, frac: Optional[float] = None, detail: bool = False) -> None:
     pass
+
+
+def fmt_n(n: int) -> str:
+    """1234567 -> '1.234.567'"""
+    return f"{int(n):,}".replace(",", ".")
+
+
+def fmt_mb(b: float) -> str:
+    return f"{b / 1e6:,.1f} MB".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def fmt_dur(sec: float) -> str:
+    sec = int(sec)
+    return f"{sec // 3600}:{sec // 60 % 60:02d}:{sec % 60:02d}" if sec >= 3600 else f"{sec // 60}:{sec % 60:02d}"
+
+
+def _dir_size(path: str) -> int:
+    tot = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                tot += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return tot
+
+
+class Ticker:
+    """Emits a status update every second while a blocking step runs.
+
+    ``watch`` may be a file or directory whose size is reported (e.g. the
+    database file H2 is writing), so the user sees that something happens.
+    """
+
+    def __init__(self, progress: ProgressCb, text: str, watch: Optional[str] = None, interval: float = 1.0):
+        self.progress, self.text, self.watch, self.interval = progress, text, watch, interval
+        self._stop = threading.Event()
+        self._t0 = time.time()
+        self._th = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            extra = ""
+            if self.watch:
+                try:
+                    size = _dir_size(self.watch) if os.path.isdir(self.watch) else os.path.getsize(self.watch)
+                    extra = f", {fmt_mb(size)} geschrieben"
+                except OSError:
+                    pass
+            self.progress(f"{self.text} – läuft seit {fmt_dur(time.time() - self._t0)}{extra}", None, True)
+
+    def __enter__(self):
+        self._th.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._th.join(2)
+        return False
+
+
+def copy_with_progress(src: str, dst: str, progress: ProgressCb, text: str,
+                       cancel: Optional[threading.Event] = None) -> None:
+    total = os.path.getsize(src)
+    done = 0
+    last = 0.0
+    t0 = time.time()
+    with open(src, "rb") as fi, open(dst, "wb") as fo:
+        while True:
+            _check_cancel(cancel)
+            b = fi.read(8 * 1024 * 1024)
+            if not b:
+                break
+            fo.write(b)
+            done += len(b)
+            now = time.time()
+            if now - last >= 0.5:
+                last = now
+                rate = done / max(0.001, now - t0)
+                progress(f"{text}: {fmt_mb(done)} von {fmt_mb(total)} ({rate / 1e6:.0f} MB/s)",
+                         None, True)
+    shutil.copystat(src, dst)
 
 
 def _check_cancel(cancel: Optional[threading.Event]) -> None:
@@ -628,8 +713,9 @@ class Database:
             dest = self.copy_base + ext
             if os.path.exists(dest):
                 os.remove(dest)
-            progress(f"{self.label}: kopiere {self.info.path} ({self.info.size / 1e6:.1f} MB) ...", None)
-            shutil.copyfile(self.info.path, dest)
+            progress(f"{self.label}: kopiere {self.info.path} ({fmt_mb(self.info.size)}) ins Arbeitsverzeichnis",
+                     None)
+            copy_with_progress(self.info.path, dest, progress, f"{self.label}: kopiere")
             if self.info.kind == "mv":
                 # verify that the copy is identical in size
                 if os.path.getsize(dest) != self.info.size:
@@ -730,7 +816,8 @@ class Database:
         for i, t in enumerate(data):
             _check_cancel(cancel)
             if i % 20 == 0:
-                progress(f"{self.label}: analysiere {t.name}", i / max(1, len(data)))
+                progress(f"{self.label}: analysiere Datenpunkt {i + 1}/{len(data)} ({t.name})",
+                         i / max(1, len(data)), True)
             self.table_stats(t)
 
     def table_stats(self, t: TableInfo) -> None:
@@ -827,7 +914,11 @@ class Database:
         data = [t for t in self.tables.values() if t.is_data]
         for i, t in enumerate(data):
             _check_cancel(cancel)
-            progress(f"{self.label}: prüfe {t.name}", i / max(1, len(data)))
+            progress(f"{self.label}: prüfe Datenpunkt {i + 1}/{len(data)} ({t.name}), "
+                     f"bisher {fmt_n(sum(v[0] for v in res.values()))} Werte gelesen",
+                     i / max(1, len(data)), True)
+            if i and i % max(1, len(data) // 10) == 0:
+                progress(f"{self.label}: Prüfung {i * 100 // len(data)} % ({i}/{len(data)} Datenpunkte)", None)
             lo = t.min_ms if t.min_ms is not None else 0
             hi = t.max_ms if t.max_ms is not None else int(time.time() * 1000) + 365 * DAY_MS
             cols = t.column_names
@@ -836,6 +927,8 @@ class Database:
             for b in r.batches(lo, hi, t.count):
                 n += len(b)
             res[t.name] = (n, r.lost)
+            if r.lost:
+                progress(f"{self.label}: WARNUNG {t.name}: {len(r.lost)} unlesbare Bereiche", None)
             if r.lost or (t.count is not None and n != t.count):
                 t.error = (f"{len(r.lost)} unlesbare Bereiche, {n} von {t.count} Werten lesbar: "
                            + "; ".join(f"{ms_to_str(a)}..{ms_to_str(b)}" for a, b in r.lost[:5]))
@@ -886,6 +979,12 @@ class ZipSourceInfo:
 
 
 _DATETIME_COL = re.compile(rb'^(    "(?:[^"]|"")+" )DATETIME\b')
+_DATETIME_COL_STR = re.compile(r'^(\s+"(?:[^"]|"")+" )DATETIME\b', re.M)
+
+
+def convert_1x_ddl(stmt: str) -> str:
+    """Column types of H2 1.x scripts that H2 2.x (FROM_1X) does not accept any more."""
+    return _DATETIME_COL_STR.sub(r"\1TIMESTAMP", stmt) if "DATETIME" in stmt else stmt
 
 
 def inspect_zip(path: str) -> ZipSourceInfo:
@@ -920,9 +1019,11 @@ def import_zip_source(path: str, jar: str, workdir: str, user: str = "sa", passw
     drv = H2Driver.get(jar)
     zdir = unique_dir(workdir, "zip")
     target = os.path.join(zdir, os.path.basename(zi.entry))
-    progress(f"ZIP: entpacke {zi.entry} ({zi.size / 1e6:.1f} MB) ...", None)
+    progress(f"ZIP: entpacke {zi.entry} ({fmt_mb(zi.size)})", None)
     convert = zi.kind == "script" and zi.script_version is None and not drv.v1
     with zipfile.ZipFile(path) as z, z.open(zi.entry) as fi, open(target, "wb") as fo:
+        done = 0
+        last = 0.0
         if convert:
             # H2 1.x -> 2.x: column types that FROM_1X does not translate
             n = 0
@@ -930,9 +1031,14 @@ def import_zip_source(path: str, jar: str, workdir: str, user: str = "sa", passw
                 if line.startswith(b"    \"") and b"DATETIME" in line:
                     line = _DATETIME_COL.sub(rb"\1TIMESTAMP", line)
                 fo.write(line)
+                done += len(line)
                 n += 1
                 if n % 100_000 == 0:
                     _check_cancel(cancel)
+                    if time.time() - last >= 0.5:
+                        last = time.time()
+                        progress(f"ZIP: entpacke {fmt_mb(done)} von {fmt_mb(zi.size)}",
+                                 done / max(1, zi.size), True)
         else:
             while True:
                 _check_cancel(cancel)
@@ -940,6 +1046,8 @@ def import_zip_source(path: str, jar: str, workdir: str, user: str = "sa", passw
                 if not b:
                     break
                 fo.write(b)
+                done += len(b)
+                progress(f"ZIP: entpacke {fmt_mb(done)} von {fmt_mb(zi.size)}", done / max(1, zi.size), True)
     if zi.kind == "db":
         return target, zi
     sv = zi.script_version
@@ -967,8 +1075,10 @@ def import_zip_source(path: str, jar: str, workdir: str, user: str = "sa", passw
                     pass
                 return
     threading.Thread(target=watch, daemon=True).start()
+    t0 = time.time()
     try:
-        st.execute(sql)
+        with Ticker(progress, f"ZIP: spiele Skript ({fmt_mb(zi.size)}) ein", base + ".mv.db"):
+            st.execute(sql)
     except Exception:
         _check_cancel(cancel)
         raise
@@ -977,7 +1087,8 @@ def import_zip_source(path: str, jar: str, workdir: str, user: str = "sa", passw
         st.close()
         conn.close()
     os.remove(target)
-    progress("ZIP: Import fertig", None)
+    progress(f"ZIP: Import fertig nach {fmt_dur(time.time() - t0)} "
+             f"(Datenbank {fmt_mb(os.path.getsize(base + '.mv.db'))})", None)
     return base + ".mv.db", zi
 
 
@@ -1016,7 +1127,8 @@ def recover_database(file_path: str, jar: str, workdir: str, user: str = "sa", p
     progress(f"Recover: kopiere {file_path} ...", None)
     shutil.copyfile(info.path, os.path.join(rdir, name + ext))
     progress(f"Recover: H2 {drv.version} org.h2.tools.Recover läuft (kann dauern) ...", None)
-    drv.run_tool("org.h2.tools.Recover", ["-dir", rdir, "-db", name])
+    with Ticker(progress, "Recover: lese defekte Datenbank", rdir):
+        drv.run_tool("org.h2.tools.Recover", ["-dir", rdir, "-db", name])
     script = os.path.join(rdir, name + ".h2.sql")
     if not os.path.exists(script):
         raise RuntimeError("Recover hat kein SQL-Skript erzeugt.")
@@ -1024,7 +1136,8 @@ def recover_database(file_path: str, jar: str, workdir: str, user: str = "sa", p
     newbase = os.path.join(rdir, name + "_recovered")
     conn = drv.connect(f"jdbc:h2:file:{newbase}", user, password)
     try:
-        execute(conn, f"RUNSCRIPT FROM '{script.replace(chr(39), chr(39) * 2)}'")
+        with Ticker(progress, "Recover: spiele gerettetes Skript ein", newbase + ".mv.db"):
+            execute(conn, f"RUNSCRIPT FROM '{script.replace(chr(39), chr(39) * 2)}'")
     finally:
         conn.close()
     try:
@@ -1095,6 +1208,31 @@ class MergeReport:
     duration_s: float = 0.0
     ok: bool = False
 
+    def summary(self, max_items: int = 10) -> str:
+        """Short version for the GUI log; the full table is in the report file."""
+        tot = [sum(getattr(s, a) for s in self.stats) for a in ("read", "inserted", "dup", "range_skip", "failed")]
+        lost = [s for s in self.stats if s.lost]
+        errs = [s for s in self.stats if s.errors]
+        bad = {k: v for k, v in self.verify.items() if v[0] != v[1]}
+        L = [f"Ergebnis: {self.output_path}",
+             f"Status: {'OK' if self.ok else 'FEHLER/WARNUNGEN'}, Dauer {fmt_dur(self.duration_s)}",
+             f"Werte: {fmt_n(tot[0])} gelesen, {fmt_n(tot[1])} geschrieben, {fmt_n(tot[2])} Duplikate, "
+             f"{fmt_n(tot[3])} wegen Zeitraum-Priorität übersprungen, {fmt_n(tot[4])} nicht schreibbar",
+             f"Quelldateien unverändert: " + ", ".join(f"{k}={'ja' if v else 'NEIN'}"
+                                                     for k, v in self.sources_unchanged.items()),
+             f"Verifikation: {len(self.verify) - len(bad)} von {len(self.verify)} Tabellen stimmen"]
+        if lost:
+            L.append(f"WARNUNG: {len(lost)} Datenpunkte mit unlesbaren Bereichen, z.B. "
+                     + ", ".join(f"{s.table} ({s.source})" for s in lost[:3]))
+        if errs:
+            L.append(f"FEHLER bei {len(errs)} Datenpunkten, z.B.:")
+            L += [f"  {s.table} ({s.source}): {s.errors[0].splitlines()[0][:150]}" for s in errs[:max_items]]
+        if bad:
+            L.append(f"FEHLER: {len(bad)} Tabellen weichen bei der Verifikation ab")
+        if self.warnings:
+            L.append(f"{len(self.warnings)} Hinweise (z.B. neu vergebene DP_IDs) – siehe Bericht")
+        return "\n".join(L)
+
     def text(self) -> str:
         L = [f"Ergebnis: {self.output_path}", f"Dauer: {self.duration_s:.1f} s",
              f"Status: {'OK' if self.ok else 'FEHLER/WARNUNGEN'}", ""]
@@ -1149,6 +1287,8 @@ class MergeJob:
         self._name_counter = 0
         self._temp_indexes: list[str] = []
         self._expected: dict[str, int] = {}
+        self._inserted_total = 0
+        self._t_data = time.time()
 
     # -- checks ------------------------------------------------------------
     def _check_output(self) -> str:
@@ -1195,7 +1335,8 @@ class MergeJob:
             self.progress("Schließe neue Datenbank" + (" (Kompaktierung)" if self.opts.compact else ""), 0.97)
             self.tconn.setAutoCommit(True)
             if self.opts.compact:
-                execute(self.tconn, "SHUTDOWN COMPACT")
+                with Ticker(self.progress, "Kompaktiere neue Datenbank", os.path.dirname(self.tbase)):
+                    execute(self.tconn, "SHUTDOWN COMPACT")
             self.tconn.close()
             self.tconn = None
             self._verify(user, pw)
@@ -1238,8 +1379,11 @@ class MergeJob:
 
     def _runscript(self, src: Database, lines: list[str], tag: str) -> None:
         path = f"{self.tbase}_{tag}.sql"
+        convert = src.driver.v1 and not self.tdrv.v1
         with open(path, "w", encoding="utf-8") as f:
             for ln in lines:
+                if convert:
+                    ln = convert_1x_ddl(ln)
                 f.write(ln.rstrip().rstrip(";") + ";\n")
         sql = f"RUNSCRIPT FROM '{path.replace(chr(39), chr(39) * 2)}' CHARSET 'UTF-8'"
         if src.driver.v1 and not self.tdrv.v1:
@@ -1413,9 +1557,19 @@ class MergeJob:
                     total += s.db.tables[name].count or 0
         done = [0]
         self._total = max(1, total)
+        self._inserted_total = 0
+        self._t_data = time.time()
         n_tables = len(order)
+        self.progress(f"Übertrage {n_tables} Datenpunkte, bis zu {fmt_n(total)} Werte", 0.05)
+        next_pct = 10
         for i, name in enumerate(order):
             _check_cancel(self.cancel)
+            pct = int(100 * done[0] / self._total)
+            if pct >= next_pct and i:
+                self.progress(f"Fortschritt {pct} %: {i}/{n_tables} Datenpunkte, "
+                              f"{fmt_n(self._inserted_total)} Werte geschrieben "
+                              f"({fmt_dur(time.time() - self._t_data)})", None)
+                next_pct = pct + 10
             covered: list[tuple[int, int]] = []
             first = True
             for s in self.sources:
@@ -1430,6 +1584,10 @@ class MergeJob:
                     continue
                 st = self._transfer(s, name, first, covered, done, i, n_tables)
                 self.report.stats.append(st)
+                self._inserted_total += st.inserted
+                if st.lost or st.failed:
+                    self.progress(f"WARNUNG {name} aus {s.db.label}: {len(st.lost)} unlesbare Bereiche, "
+                                  f"{st.failed} Werte nicht schreibbar (Details im Bericht)", None)
                 self._expected[name] = self._expected.get(name, 0) + st.inserted
                 if st.inserted:
                     first = False
@@ -1510,8 +1668,10 @@ class MergeJob:
                     st.min_ms = m0 if st.min_ms is None else min(st.min_ms, m0)
                     st.max_ms = m1 if st.max_ms is None else max(st.max_ms, m1)
                 done[0] += len(batch)
-                self.progress(f"[{ti + 1}/{nt}] {table} aus {db.label}: {st.read} gelesen, "
-                              f"{st.inserted} übernommen", 0.05 + 0.9 * min(1.0, done[0] / self._total))
+                self.progress(f"Datenpunkt {ti + 1}/{nt} ({table} aus {db.label}): "
+                              f"{fmt_n(st.inserted)} übernommen – gesamt "
+                              f"{fmt_n(self._inserted_total + st.inserted)} Werte geschrieben",
+                              0.05 + 0.9 * min(1.0, done[0] / self._total), True)
         finally:
             ins.close()
             chk.close()
@@ -1547,10 +1707,13 @@ class MergeJob:
 
     # -- verification ------------------------------------------------------
     def _verify(self, user: str, pw: str) -> None:
-        self.progress("Verifiziere neue Datenbank ...", 0.98)
+        self.progress(f"Daten geschrieben: {fmt_n(self._inserted_total)} Werte in "
+                      f"{fmt_dur(time.time() - self._t_data)}. Verifiziere neue Datenbank ...", 0.98)
         conn = self.tdrv.connect(f"jdbc:h2:file:{self.tbase};IFEXISTS=TRUE", user, pw)
         try:
-            for table, exp in self._expected.items():
+            for k, (table, exp) in enumerate(self._expected.items()):
+                if k % 20 == 0:
+                    self.progress(f"Verifiziere Tabelle {k + 1}/{len(self._expected)}", None, True)
                 try:
                     got = int(py(query_all(conn, f"SELECT COUNT(*) FROM {q(table)}")[0][0]))
                 except Exception as e:  # noqa: BLE001

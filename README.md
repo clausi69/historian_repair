@@ -80,6 +80,23 @@ installiert), Interpreter `.venv` wählen und im „Ausführen und Debuggen“-B
 **„Historian Repair: GUI“** starten (F5). Linux/macOS: `python3 -m venv .venv`
 und `.venv/bin/python -m pip install …`.
 
+### Gespeicherte Einstellungen
+
+Das Tool merkt sich automatisch (alle 15 s, bei jeder Änderung an den Quellen
+und beim Beenden) in `%USERPROFILE%\.historian_repair.json` bzw.
+`~/.historian_repair.json`:
+Arbeitsverzeichnis, Java-Pfad, alle Quellen in ihrer Reihenfolge (Datei,
+H2-JAR, Benutzer, Passwort, Zeitraum, „übernehmen“-Haken) sowie die
+Zieleinstellungen. Beim nächsten Start sind die Quellen vorbelegt;
+**„Alle öffnen“** öffnet sie nacheinander.
+Passwörter: unter Windows mit DPAPI für das eigene Benutzerkonto verschlüsselt,
+auf anderen Systemen nur kodiert (nicht verschlüsselt). Abschaltbar über den
+Haken „Passwörter merken“.
+
+Das Protokoll enthält nur Meilensteine, Fortschritt in 10-%-Schritten und
+Auffälligkeiten (rot); laufende Zähler (kopierte MB, geschriebene Werte,
+Laufzeit bei Kompaktierung/Skript-Import) stehen in der Statuszeile unten.
+
 ## Ablauf (typischer Rettungsfall)
 
 1. **CCU-Historian stoppen** (bzw. Datenbankdatei vorher wegkopieren). Liegt

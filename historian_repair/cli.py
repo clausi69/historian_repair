@@ -12,7 +12,16 @@ import time
 from . import h2engine as E
 
 
-def _progress(msg: str, frac=None) -> None:
+_last_detail = [0.0]
+
+
+def _progress(msg: str, frac=None, detail: bool = False) -> None:
+    """Milestones are always printed, frequent status updates at most every 5 s."""
+    if detail:
+        now = time.time()
+        if now - _last_detail[0] < 5:
+            return
+        _last_detail[0] = now
     pct = f"{frac * 100:5.1f}% " if frac is not None else "       "
     print(f"{pct}{msg}", flush=True)
 
