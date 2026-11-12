@@ -208,6 +208,13 @@ def inspect_db_file(path: str) -> DbFileInfo:
     return info
 
 
+def unique_dir(parent: str, prefix: str) -> str:
+    """Create a new, guaranteed unique work directory (timestamp + random suffix)."""
+    import tempfile
+    os.makedirs(parent, exist_ok=True)
+    return tempfile.mkdtemp(prefix=f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}_", dir=os.path.abspath(parent))
+
+
 def file_fingerprint(path: str) -> tuple[int, int]:
     st = os.stat(path)
     return st.st_size, st.st_mtime_ns
@@ -766,8 +773,7 @@ def import_zip_source(path: str, jar: str, workdir: str, user: str = "sa", passw
     """
     zi = inspect_zip(path)
     drv = H2Driver.get(jar)
-    zdir = os.path.join(os.path.abspath(workdir), "zip_" + time.strftime("%Y%m%d_%H%M%S"))
-    os.makedirs(zdir, exist_ok=True)
+    zdir = unique_dir(workdir, "zip")
     target = os.path.join(zdir, os.path.basename(zi.entry))
     progress(f"ZIP: entpacke {zi.entry} ({zi.size / 1e6:.1f} MB) ...", None)
     convert = zi.kind == "script" and zi.script_version is None and not drv.v1
@@ -859,9 +865,7 @@ def recover_database(file_path: str, jar: str, workdir: str, user: str = "sa", p
     """
     info = inspect_db_file(file_path)
     drv = H2Driver.get(jar)
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    rdir = os.path.join(os.path.abspath(workdir), f"recover_{ts}")
-    os.makedirs(rdir, exist_ok=True)
+    rdir = unique_dir(workdir, "recover")
     name = os.path.basename(info.base)
     ext = ".mv.db" if info.kind == "mv" else ".h2.db"
     progress(f"Recover: kopiere {file_path} ...", None)
@@ -1027,8 +1031,7 @@ class MergeJob:
         user = self.opts.user if self.opts.user is not None else tmpl.user
         pw = self.opts.password if self.opts.password is not None else tmpl.password
         workdir = self.opts.workdir or os.path.join(os.path.dirname(out), "historian_repair_work")
-        tdir = os.path.join(workdir, "target_" + time.strftime("%Y%m%d_%H%M%S"))
-        os.makedirs(tdir, exist_ok=True)
+        tdir = unique_dir(workdir, "target")
         self.tbase = os.path.join(tdir, os.path.basename(out)[:-6])
         self.tdrv = H2Driver.get(self.opts.target_jar)
         for s in self.sources:

@@ -186,8 +186,7 @@ def carve_database(file_path: str, jar: str, workdir: str, user: str = "sa", pas
     def J(n):
         return jpype.JClass(n, loader=L)
 
-    rdir = os.path.join(os.path.abspath(workdir), "carve_" + time.strftime("%Y%m%d_%H%M%S"))
-    os.makedirs(rdir, exist_ok=True)
+    rdir = E.unique_dir(workdir, "carve")
     src = os.path.join(rdir, "source_copy.mv.db")
     progress(f"Carving: kopiere {file_path} ...", None)
     shutil.copyfile(info.path, src)
