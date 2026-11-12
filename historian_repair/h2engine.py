@@ -36,7 +36,7 @@ log = logging.getLogger("historian_repair")
 # Constants / helpers
 # ---------------------------------------------------------------------------
 
-H2_DOWNLOAD_VERSIONS = ["1.4.200", "2.1.214", "2.2.224", "2.3.232"]
+H2_DOWNLOAD_VERSIONS = ["1.4.200", "2.1.214", "2.2.224", "2.3.232", "2.4.240", "2.5.252"]
 MAVEN_URL = "https://repo1.maven.org/maven2/com/h2database/h2/{v}/h2-{v}.jar"
 
 FORMAT_TEXT = {
@@ -439,6 +439,7 @@ class Database:
         self.driver: Optional[H2Driver] = None
         self.conn = None
         self.copy_base: Optional[str] = None
+        self.origin = self.info.path          # file the user selected (may be a zip)
         self.original_fingerprint = file_fingerprint(self.info.path)
         self.tables: dict[str, TableInfo] = {}
         self.datapoints: list[dict] = []
@@ -517,8 +518,12 @@ class Database:
             pass
         self.conn = None
 
+    def set_origin(self, path: str) -> None:
+        self.origin = os.path.abspath(path)
+        self.original_fingerprint = file_fingerprint(self.origin)
+
     def original_unchanged(self) -> bool:
-        return file_fingerprint(self.info.path) == self.original_fingerprint
+        return file_fingerprint(self.origin) == self.original_fingerprint
 
     # -- metadata ----------------------------------------------------------
     def load_tables(self) -> dict[str, TableInfo]:
@@ -710,6 +715,138 @@ def _range_where(tc: str, lo: Optional[int], hi: Optional[int]) -> tuple[str, li
 
 
 # ---------------------------------------------------------------------------
+# ZIP backups (SQL script or database file inside)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ZipSourceInfo:
+    path: str
+    kind: str                      # "script" | "db"
+    entry: str
+    size: int                      # uncompressed size of the entry
+    script_version: Optional[str] = None   # "2.5.252", or None = H2 1.x (no version line)
+
+    def text(self) -> str:
+        if self.kind == "db":
+            return f"ZIP mit Datenbankdatei {self.entry} ({self.size / 1e6:.1f} MB)"
+        v = self.script_version or "1.x (keine Versionszeile)"
+        return f"ZIP mit SQL-Skript {self.entry} ({self.size / 1e6:.1f} MB), erzeugt von H2 {v}"
+
+
+_DATETIME_COL = re.compile(rb'^(    "(?:[^"]|"")+" )DATETIME\b')
+
+
+def inspect_zip(path: str) -> ZipSourceInfo:
+    with zipfile.ZipFile(path) as z:
+        infos = [i for i in z.infolist() if not i.is_dir()]
+        dbs = [i for i in infos if i.filename.endswith((".mv.db", ".h2.db"))]
+        if dbs:
+            i = max(dbs, key=lambda x: x.file_size)
+            return ZipSourceInfo(os.path.abspath(path), "db", i.filename, i.file_size)
+        cands = [i for i in infos if i.filename.lower().endswith(".sql")] or infos
+        if not cands:
+            raise ValueError("ZIP-Datei ist leer")
+        i = max(cands, key=lambda x: x.file_size)
+        with z.open(i) as f:
+            head = f.read(4096).decode("utf-8", "replace")
+        if "CREATE" not in head.upper() and not head.lstrip().startswith("--"):
+            raise ValueError(f"{i.filename} sieht nicht wie ein H2-SQL-Skript aus")
+        m = re.match(r"\s*--\s*H2\s+(\d+\.\d+\.\d+)", head)
+        return ZipSourceInfo(os.path.abspath(path), "script", i.filename, i.file_size,
+                             m.group(1) if m else None)
+
+
+def import_zip_source(path: str, jar: str, workdir: str, user: str = "sa", password: str = "",
+                      progress: ProgressCb = _noop_progress,
+                      cancel: Optional[threading.Event] = None) -> tuple[str, ZipSourceInfo]:
+    """Extract a zip backup into the work directory and return a .mv.db/.h2.db to open.
+
+    A SQL script is imported with RUNSCRIPT into a new database (FROM_1X when a
+    1.x script is imported with an H2 2.x jar). The zip itself is only read.
+    """
+    zi = inspect_zip(path)
+    drv = H2Driver.get(jar)
+    zdir = os.path.join(os.path.abspath(workdir), "zip_" + time.strftime("%Y%m%d_%H%M%S"))
+    os.makedirs(zdir, exist_ok=True)
+    target = os.path.join(zdir, os.path.basename(zi.entry))
+    progress(f"ZIP: entpacke {zi.entry} ({zi.size / 1e6:.1f} MB) ...", None)
+    convert = zi.kind == "script" and zi.script_version is None and not drv.v1
+    with zipfile.ZipFile(path) as z, z.open(zi.entry) as fi, open(target, "wb") as fo:
+        if convert:
+            # H2 1.x -> 2.x: column types that FROM_1X does not translate
+            n = 0
+            for line in fi:
+                if line.startswith(b"    \"") and b"DATETIME" in line:
+                    line = _DATETIME_COL.sub(rb"\1TIMESTAMP", line)
+                fo.write(line)
+                n += 1
+                if n % 100_000 == 0:
+                    _check_cancel(cancel)
+        else:
+            while True:
+                _check_cancel(cancel)
+                b = fi.read(16 * 1024 * 1024)
+                if not b:
+                    break
+                fo.write(b)
+    if zi.kind == "db":
+        return target, zi
+    sv = zi.script_version
+    if sv is not None and drv.v1:
+        raise RuntimeError(f"Das Skript stammt von H2 {sv}; bitte ein H2-2.x-JAR (>= {sv}) wählen.")
+    if sv is not None and _version_tuple(drv.version) < _version_tuple(sv):
+        raise RuntimeError(f"Das Skript stammt von H2 {sv}, gewählt ist H2 {drv.version}. "
+                           f"Bitte ein JAR mit Version >= {sv} wählen (z.B. über 'H2 laden…').")
+    base = os.path.join(zdir, re.sub(r"\.zip$", "", os.path.basename(path), flags=re.I) + "_import")
+    sql = f"RUNSCRIPT FROM '{target.replace(chr(39), chr(39) * 2)}' CHARSET 'UTF-8'"
+    if sv is None and not drv.v1:
+        sql += " FROM_1X"
+    progress(f"ZIP: importiere Skript mit H2 {drv.version}{' (FROM_1X)' if 'FROM_1X' in sql else ''} "
+             f"– dauert bei großen Sicherungen länger ...", None)
+    conn = drv.connect(f"jdbc:h2:file:{base}", user, password)
+    st = conn.createStatement()
+    done = threading.Event()
+
+    def watch():
+        while not done.wait(0.5):
+            if cancel is not None and cancel.is_set():
+                try:
+                    st.cancel()
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+    threading.Thread(target=watch, daemon=True).start()
+    try:
+        st.execute(sql)
+    except Exception:
+        _check_cancel(cancel)
+        raise
+    finally:
+        done.set()
+        st.close()
+        conn.close()
+    os.remove(target)
+    progress("ZIP: Import fertig", None)
+    return base + ".mv.db", zi
+
+
+def open_source(label: str, path: str, jar: str, user: str = "sa", password: str = "",
+                workdir: str = ".", progress: ProgressCb = _noop_progress,
+                cancel: Optional[threading.Event] = None) -> "Database":
+    """Open a source given as .mv.db/.h2.db or as .zip backup (always via a copy)."""
+    if path.lower().endswith(".zip"):
+        dbpath, zi = import_zip_source(path, jar, workdir, user, password, progress, cancel)
+        db = Database(label, dbpath, jar, user, password, workdir, copy=False)
+        db.set_origin(path)
+        db.recovered_from = os.path.abspath(path)
+        db.zip_info = zi
+    else:
+        db = Database(label, path, jar, user, password, workdir)
+    db.open(progress)
+    return db
+
+
+# ---------------------------------------------------------------------------
 # Recovery of databases that cannot be opened
 # ---------------------------------------------------------------------------
 
@@ -871,6 +1008,8 @@ class MergeJob:
             out += ".mv.db"
         for s in self.sources:
             if os.path.normcase(out) == os.path.normcase(s.db.info.path):
+                raise ValueError("Ausgabedatei darf keine Quelldatei sein (nicht-invasiver Betrieb).")
+            if os.path.normcase(out) == os.path.normcase(getattr(s.db, "origin", s.db.info.path)):
                 raise ValueError("Ausgabedatei darf keine Quelldatei sein (nicht-invasiver Betrieb).")
             rec = s.db.recovered_from
             if rec and os.path.normcase(out) == os.path.normcase(os.path.abspath(rec)):

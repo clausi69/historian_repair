@@ -148,3 +148,55 @@ def test_rollback_detection(dbs):
     ana = C.analyze_mvstore(a)
     assert not ana.rollback_suspected
     assert ana.chunks
+
+
+J25 = os.path.join(ROOT, "jars", "h2-2.5.252.jar")
+
+
+def _script_zip(dbfile, jar, zpath):
+    c = E.H2Driver.get(jar).connect(f"jdbc:h2:file:{dbfile[:-6]};IFEXISTS=TRUE;ACCESS_MODE_DATA=r", "sa", "")
+    E.execute(c, f"SCRIPT TO '{zpath}' COMPRESSION ZIP")
+    c.close()
+
+
+@pytest.mark.skipif(not os.path.exists(J25), reason="h2-2.5.252.jar missing")
+def test_zip_sources(dbs):
+    import zipfile
+    d, a, b, _ = dbs
+    za = str(d / "backup_a_14.zip")
+    zb = str(d / "backup_b_23.zip")
+    zdb = str(d / "backup_db.zip")
+    shutil.copy(a, str(d / "tmp_a.mv.db"))
+    _script_zip(str(d / "tmp_a.mv.db"), J14, za)            # 1.4 script (no version line)
+    _script_zip(b, J23, zb)                                   # 2.3 script
+    with zipfile.ZipFile(zdb, "w") as z:                      # zip with database file
+        z.write(a, "history.mv.db")
+    assert E.inspect_zip(za).script_version is None
+    assert E.inspect_zip(zb).script_version == "2.3.232"
+    assert E.inspect_zip(zdb).kind == "db"
+    A = _open("A", a, J14, str(d / "work"))
+    ref = {n: (t.count, t.min_ms, t.max_ms) for n, t in A.tables.items() if t.is_data}
+    A.close()
+    for zpath, jar in ((za, J14), (za, J25), (zdb, J14)):
+        fp = E.file_fingerprint(zpath)
+        X = E.open_source("Z", zpath, jar, workdir=str(d / "work"))
+        X.scan()
+        got = {n: (t.count, t.min_ms, t.max_ms) for n, t in X.tables.items() if t.is_data}
+        assert got == ref, (zpath, jar)
+        assert len(X.datapoints) == 5
+        X.close()
+        assert E.file_fingerprint(zpath) == fp
+    with pytest.raises(RuntimeError):
+        E.open_source("Z", zb, J14, workdir=str(d / "work"))
+    Y = E.open_source("Y", zb, J25, workdir=str(d / "work"))
+    Y.scan()
+    # merge zip sources into a new 2.5 database
+    X = E.open_source("X", za, J25, workdir=str(d / "work"))
+    X.scan()
+    rep = E.MergeJob([E.SourceSpec(X), E.SourceSpec(Y)],
+                     E.MergeOptions(output_path=str(d / "zipmerge.mv.db"), target_jar=J25,
+                                    workdir=str(d / "work"), overwrite=True)).run()
+    X.close()
+    Y.close()
+    assert rep.ok, rep.text()
+    assert all(rep.sources_unchanged.values())

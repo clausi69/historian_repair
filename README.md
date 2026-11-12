@@ -28,7 +28,12 @@ CCU-Historian-Datenbanken (H2, Dateien `*.mv.db` bzw. `*.h2.db`).
   Store-Header, warnt das Tool (H2 würde sonst stillschweigend einen alten
   Stand zeigen). Quellen werden zusätzlich schreibgeschützt geöffnet
   (`ACCESS_MODE_DATA=r`), damit H2 die Arbeitskopie nicht abschneidet.
-* Migration 1.4 → 2.x möglich (Ziel-H2-Version frei wählbar).
+* **ZIP-Backups als Quelle:** ZIP mit SQL-Skript (z. B. aus
+  `SCRIPT TO '…zip' COMPRESSION ZIP`) oder mit `.mv.db`-Datei. Das Skript wird
+  in eine Arbeitsdatenbank eingespielt (`RUNSCRIPT`); die H2-Version des
+  Skripts wird aus der Kopfzeile `-- H2 x.y.z;` erkannt. 1.x-Skripte lassen
+  sich mit H2 2.x importieren (`FROM_1X`, zusätzlich `DATETIME` → `TIMESTAMP`).
+* Migration 1.4 → 2.x möglich (Ziel-H2-Version frei wählbar, bis 2.5.x).
 * Abschlussverifikation: Zeilenzahl je Tabelle in der neuen DB = Summe der
   übernommenen Werte. Bericht als `<ausgabe>_repair_report.txt` + `.json`.
 
@@ -102,6 +107,10 @@ python3 -m historian_repair recover /pfad/defekt.mv.db --jar jars/h2-1.4.200.jar
 ```
 
 ```bash
+python3 -m historian_repair merge --src backup_2024.zip@jars/h2-2.5.252.jar --src aktuell.mv.db@jars/h2-2.5.252.jar --target-jar jars/h2-2.5.252.jar --out neu/history.mv.db
+```
+
+```bash
 python3 -m historian_repair carve /pfad/defekt.mv.db --jar jars/h2-1.4.200.jar
 ```
 
@@ -159,6 +168,9 @@ Quelle geöffnet und kann normal zusammengeführt werden.
 * Recover (`org.h2.tools.Recover`) rettet nur, was H2 selbst noch lesen kann;
   völlig zerstörte Seiten sind verloren.
 * Ziel mit H2 1.x aus einer H2-2.x-Quelle wird abgelehnt (keine Rück-Migration).
+* Ein Skript einer H2-2.x-Version braucht ein JAR mindestens dieser Version.
+* Carving nur für H2-1.4-Dateien (Format 1); es lädt die Datei komplett in den
+  Speicher (RAM-Bedarf ≈ 3 × Dateigröße + gerettete Zeilen).
 
 ## Tests
 

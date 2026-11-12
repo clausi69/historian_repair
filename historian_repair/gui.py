@@ -231,7 +231,8 @@ class SourceSlot:
     def browse(self):
         p = filedialog.askopenfilename(
             title=f"Quelle {self.label}: CCU-Historian-Datenbank wählen",
-            filetypes=[("H2 Datenbank", "*.mv.db *.h2.db"), ("Alle Dateien", "*.*")],
+            filetypes=[("H2 Datenbank oder Backup", "*.mv.db *.h2.db *.zip"), ("H2 Datenbank", "*.mv.db *.h2.db"),
+                       ("Backup (ZIP)", "*.zip"), ("Alle Dateien", "*.*")],
             initialdir=self.app.settings.get("last_dir") or os.path.expanduser("~"))
         if not p:
             return
@@ -240,6 +241,8 @@ class SourceSlot:
         self.inspect_file()
 
     def inspect_file(self):
+        if self.path.get().lower().endswith(".zip"):
+            return self._inspect_zip()
         try:
             info = E.inspect_db_file(self.path.get())
         except Exception as e:  # noqa: BLE001
@@ -256,6 +259,29 @@ class SourceSlot:
             self.app.log(f"{self.label}: kein passendes H2-JAR für {info.format_text} vorhanden – "
                          f"bitte über 'H2 laden…' herunterladen oder JAR hinzufügen.")
         return info
+
+    def _inspect_zip(self):
+        try:
+            zi = E.inspect_zip(self.path.get())
+        except Exception as e:  # noqa: BLE001
+            self.info.set(f"Fehler: {e}")
+            return None
+        self.info.set(zi.text())
+        jars = self.app.jars
+        if zi.kind == "script":
+            if zi.script_version is None:
+                best = next((d for d, p in jars.paths.items()
+                             if (jars.versions.get(p) or "").startswith("1.4.200")), None) or jars.newest()
+            else:
+                need = E._version_tuple(zi.script_version)
+                ok = [d for d, p in jars.paths.items() if E._version_tuple(jars.versions.get(p)) >= need]
+                best = min(ok, key=lambda d: E._version_tuple(jars.versions.get(jars.paths[d]))) if ok else None
+                if best is None:
+                    self.app.log(f"{self.label}: Skript stammt von H2 {zi.script_version} – bitte JAR >= "
+                                 f"{zi.script_version} über 'H2 laden…' holen.")
+            if best:
+                self.jar.set(best)
+        return zi
 
     def clear_range(self):
         self.t_from.set("")
@@ -286,10 +312,13 @@ class SourceSlot:
         w = self.app.worker
 
         def task():
-            db = E.Database(self.label, path, jar, user, pw, workdir, copy=recovered_path is None)
             if recovered_path:
+                db = E.Database(self.label, path, jar, user, pw, workdir, copy=False)
                 db.recovered_from = original
-            db.open(w.progress)
+                db.set_origin(original)
+                db.open(w.progress)
+            else:
+                db = E.open_source(self.label, path, jar, user, pw, workdir, w.progress, w.cancel)
             try:
                 db.scan(w.progress, w.cancel)
             except BaseException:
@@ -310,6 +339,8 @@ class SourceSlot:
                 txt += f" | ⚠ {nerr} Tabellen mit Fehlern"
             if recovered_path:
                 txt += " | (gerettete Kopie)"
+            elif getattr(db, "zip_info", None) is not None:
+                txt += " | (aus ZIP-Backup)"
             self.info.set(txt)
             self.app.log(f"{self.label} geöffnet: {txt}")
             if getattr(db, "analysis", None) is not None and db.analysis.rollback_suspected and not recovered_path:
@@ -350,6 +381,10 @@ class SourceSlot:
 
     def recover(self):
         if not self.path.get():
+            return
+        if self.path.get().lower().endswith(".zip"):
+            messagebox.showinfo("ZIP-Backup", "ZIP-Backups werden mit 'Öffnen' direkt eingespielt; "
+                                              "Recover/Carving gilt nur für .mv.db-Dateien.")
             return
         try:
             jar = self._jar_path()
@@ -403,6 +438,10 @@ class SourceSlot:
 
     def carve(self):
         if not self.path.get():
+            return
+        if self.path.get().lower().endswith(".zip"):
+            messagebox.showinfo("ZIP-Backup", "ZIP-Backups werden mit 'Öffnen' direkt eingespielt; "
+                                              "Recover/Carving gilt nur für .mv.db-Dateien.")
             return
         jar = next((p for d, p in self.app.jars.paths.items()
                     if (self.app.jars.versions.get(p) or "").startswith("1.4.200")), None)

@@ -28,6 +28,13 @@ def _split_src(spec: str, default_jar: str | None) -> tuple[str, str]:
 
 
 def cmd_info(a) -> int:
+    if a.db.lower().endswith(".zip"):
+        print(E.inspect_zip(a.db).text())
+        if not a.jar:
+            return 0
+        wd = a.workdir or os.path.join(os.path.dirname(os.path.abspath(a.db)), "historian_repair_work")
+        db = E.open_source("A", a.db, a.jar, a.user, a.password, wd, _progress)
+        return _print_db(db, a)
     info = E.inspect_db_file(a.db)
     print(f"Datei:   {info.path}")
     if info.kind == "mv":
@@ -40,8 +47,11 @@ def cmd_info(a) -> int:
     if not a.jar:
         return 0
     wd = a.workdir or os.path.join(os.path.dirname(info.path), "historian_repair_work")
-    db = E.Database("A", a.db, a.jar, a.user, a.password, wd)
-    db.open(_progress)
+    db = E.open_source("A", a.db, a.jar, a.user, a.password, wd, _progress)
+    return _print_db(db, a)
+
+
+def _print_db(db, a) -> int:
     try:
         db.scan(_progress)
         mn, mx, total = db.overall_range()
@@ -96,8 +106,7 @@ def cmd_merge(a) -> int:
     try:
         for lab, spec in zip(labels, a.src):
             path, jar = _split_src(spec, a.jar)
-            db = E.Database(lab, path, jar, a.user, a.password, wd)
-            db.open(_progress)
+            db = E.open_source(lab, path, jar, a.user, a.password, wd, _progress)
             db.scan(_progress)
             mn, mx, total = db.overall_range()
             print(f"{lab}: {path}  {E.ms_to_str(mn)} .. {E.ms_to_str(mx)}  Zeilen={total}")
@@ -154,7 +163,7 @@ def main(argv=None) -> int:
     sp.set_defaults(fn=cmd_carve)
 
     sp = sub.add_parser("merge", help="Neue DB aus Quellen erzeugen (Reihenfolge = Priorität)")
-    sp.add_argument("--src", action="append", required=True, help="PFAD[@JAR], mehrfach")
+    sp.add_argument("--src", action="append", required=True, help="PFAD[@JAR], mehrfach; PFAD darf .mv.db, .h2.db oder .zip (Backup) sein")
     sp.add_argument("--jar", help="Standard-JAR für alle Quellen")
     sp.add_argument("--target-jar", help="H2-JAR der neuen DB (Standard: JAR der ersten Quelle)")
     sp.add_argument("--out", required=True, help="neue .mv.db-Datei")
