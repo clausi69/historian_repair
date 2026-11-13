@@ -242,3 +242,72 @@ def test_ccu_historian_413_compat(dbs, tmp_path):
     assert E.inspect_db_file(out).fmt == 2
     problems = H.historian_startup_check(out[:-6], J21, stub_jar=stub)
     assert not problems, problems
+
+
+def test_reuse_workdata(dbs, tmp_path):
+    from historian_repair import cache, carve as C
+    d, a, _, _ = dbs
+    wd = str(tmp_path / "w")
+    src = str(tmp_path / "src" / "history.mv.db")
+    os.makedirs(os.path.dirname(src))
+    shutil.copy(a, src)
+    # old work data without manifest (older tool version) is ignored
+    os.makedirs(os.path.join(wd, "copy_old_x"))
+    shutil.copy(a, os.path.join(wd, "copy_old_x", "history.mv.db"))
+    X = E.open_source("A", src, J14, "sa", "", wd)
+    assert X.reuse_info == "" and X.source_sha
+    first_copy = X.copy_base
+    X.scan()
+    res1 = X.deep_check(min_skip_ms=600_000)
+    X.close()
+    Y = E.open_source("A", src, J14, "sa", "", wd)
+    assert Y.reuse_info.startswith("wiederverwendet") and Y.copy_base == first_copy
+    assert Y.source_sha == X.source_sha
+    Y.scan()
+    res2 = Y.deep_check(min_skip_ms=600_000)
+    assert Y.reuse_info.startswith("wiederverwendet") and res2 == res1
+    Y.close()
+    Z = E.open_source("A", src, J14, "sa", "", wd, reuse=False)       # "neu auswerten"
+    assert Z.reuse_info == "" and Z.copy_base != first_copy
+    Z.close()
+    # same size, one byte different -> checksum differs -> not reused
+    r = cache.Reuse(wd, src)
+    found, _ = r.find("copy", "-", {"kind": "mv"})
+    assert found
+    with open(src, "r+b") as f:
+        f.seek(os.path.getsize(src) // 2)
+        b = f.read(1)
+        f.seek(-1, 1)
+        f.write(bytes([b[0] ^ 0xFF]))
+    found, why = cache.Reuse(wd, src).find("copy", "-", {"kind": "mv"})
+    assert found is None and "Prüfsumme" in why
+    # carving result reused
+    o1, r1 = C.carve_database(a, J14, wd)
+    o2, r2 = C.carve_database(a, J14, wd)
+    assert o1 == o2 and r2.reused_info.startswith("wiederverwendet")
+
+
+@pytest.mark.skipif(not os.path.exists(J21), reason="h2-2.1.214.jar missing")
+def test_check_target(dbs, tmp_path):
+    from historian_repair import checks
+    d, a, _, _ = dbs
+    A = E.open_source("A", a, J14, "sa", "", str(tmp_path / "w"))
+    A.scan()
+    out = str(tmp_path / "out" / "history.mv.db")
+    rep = E.MergeJob([E.SourceSpec(A)], E.MergeOptions(output_path=out, target_jar=J21,
+                     workdir=str(tmp_path / "m"), user="sa", password="ccu-historian")).run()
+    A.close()
+    assert rep.ok
+    res = checks.check_historian_target(out, J21, "sa", "ccu-historian", str(tmp_path / "w"))
+    assert res.errors == 0, res.text()
+    bad = checks.check_historian_target(out, J21, "sa", "falsch", str(tmp_path / "w"))
+    assert bad.errors == 1
+    if os.path.exists(J25):
+        out25 = str(tmp_path / "out25" / "history.mv.db")
+        A = E.open_source("A", a, J14, "sa", "", str(tmp_path / "w"))
+        A.scan()
+        E.MergeJob([E.SourceSpec(A)], E.MergeOptions(output_path=out25, target_jar=J25,
+                   workdir=str(tmp_path / "m"))).run()
+        A.close()
+        r25 = checks.check_historian_target(out25, J25, "sa", "", str(tmp_path / "w"))
+        assert r25.errors >= 1 and "Dateiformat 3" in r25.text()

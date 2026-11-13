@@ -310,18 +310,19 @@ class SourceSlot:
             return
         self.close()
         workdir = self.app.workdir()
+        reuse = self.app.reuse.get()
         path = recovered_path or self.path.get()
         user, pw = self.user.get(), self.password.get()
         w = self.app.worker
 
         def task():
             if recovered_path:
-                db = E.Database(self.label, path, jar, user, pw, workdir, copy=False)
+                db = E.Database(self.label, path, jar, user, pw, workdir, copy=False, reuse=reuse)
                 db.recovered_from = original
                 db.set_origin(original)
                 db.open(w.progress)
             else:
-                db = E.open_source(self.label, path, jar, user, pw, workdir, w.progress, w.cancel)
+                db = E.open_source(self.label, path, jar, user, pw, workdir, w.progress, w.cancel, reuse)
             try:
                 db.scan(w.progress, w.cancel)
             except BaseException:
@@ -408,11 +409,12 @@ class SourceSlot:
             return
         self.close()
         workdir = self.app.workdir()
+        reuse = self.app.reuse.get()
         path, user, pw = self.path.get(), self.user.get(), self.password.get()
         w = self.app.worker
 
         def task():
-            return E.recover_database(path, jar, workdir, user, pw, w.progress)
+            return E.recover_database(path, jar, workdir, user, pw, w.progress, w.cancel, reuse)
 
         def done(newpath):
             self.app.log(f"{self.label}: Recover erzeugte {newpath}")
@@ -434,6 +436,8 @@ class SourceSlot:
             min_skip = int(float(self.app.min_skip.get()) * 1000)
         except ValueError:
             min_skip = 600_000
+
+        db.reuse = self.app.reuse.get()
 
         def task():
             return db.deep_check(w.progress, w.cancel, min_skip)
@@ -466,12 +470,13 @@ class SourceSlot:
             return
         self.close()
         workdir = self.app.workdir()
+        reuse = self.app.reuse.get()
         path, user, pw = self.path.get(), self.user.get(), self.password.get()
         w = self.app.worker
 
         def task():
             from . import carve as C
-            return C.carve_database(path, jar, workdir, user, pw, w.progress, w.cancel)
+            return C.carve_database(path, jar, workdir, user, pw, w.progress, w.cancel, reuse)
 
         def done(res):
             out, rep = res
@@ -524,6 +529,7 @@ class App:
             "workdir", os.path.join(os.path.expanduser("~"), "historian_repair_work")))
         self.jvm_var = tk.StringVar(value=self.settings.get("jvm", ""))
         self.save_pw = tk.BooleanVar(value=self.settings.get("save_passwords", True))
+        self.reuse = tk.BooleanVar(value=self.settings.get("reuse_workdata", True))
         self.t_user = tk.StringVar(value=self.settings.get("target_user", E.HISTORIAN_DEFAULT_USER))
         self.t_password = tk.StringVar(value=secret.unprotect(self.settings.get("target_password", ""))
                                        or E.HISTORIAN_DEFAULT_PASSWORD)
@@ -547,6 +553,8 @@ class App:
         ttk.Button(top, text="H2 laden…", command=self._download_jar).pack(side="left", padx=2)
         ttk.Button(top, text="+ Quelle", command=self.add_slot).pack(side="right")
         ttk.Button(top, text="Alle öffnen", command=self.open_all).pack(side="right", padx=4)
+        ttk.Checkbutton(top, text="Arbeitsdaten wiederverwenden", variable=self.reuse,
+                        command=self._reuse_hint).pack(side="right", padx=8)
         ttk.Checkbutton(top, text="Passwörter merken", variable=self.save_pw,
                         command=self._pw_hint).pack(side="right", padx=8)
 
@@ -656,6 +664,8 @@ class App:
         self.b_preview.pack(fill="x")
         self.b_run = ttk.Button(btn, text="Neue Datenbank erstellen", command=self.run_merge)
         self.b_run.pack(fill="x", pady=4)
+        self.b_check = ttk.Button(btn, text="Ziel prüfen…", command=self.check_target)
+        self.b_check.pack(fill="x", pady=(0, 4))
         self.b_cancel = ttk.Button(btn, text="Abbrechen", command=self.worker.cancel.set, state="disabled")
         self.b_cancel.pack(fill="x")
         tg.columnconfigure(1, weight=1)
@@ -690,6 +700,7 @@ class App:
         self.b_cancel.configure(state="normal" if busy else "disabled")
         self.b_run.configure(state="disabled" if busy else "normal")
         self.b_preview.configure(state="disabled" if busy else "normal")
+        self.b_check.configure(state="disabled" if busy else "normal")
         if busy:
             self.pbar.configure(mode="indeterminate")
             self.pbar.start(15)
@@ -1261,6 +1272,7 @@ class App:
                   "template_index": labels.index(self.template.get()) if self.template.get() in labels else 0,
                   "dedup": self.dedup.get(), "min_skip": self.min_skip.get(), "compact": self.compact.get(),
                   "keep_work": self.keep_work.get(), "target_user": self.t_user.get(),
+                  "reuse_workdata": self.reuse.get(), "tool_version": __version__,
                   "target_password": secret.protect(self.t_password.get()) if self.save_pw.get() else ""})
         return s
 
@@ -1316,9 +1328,66 @@ class App:
         self.min_skip.set(st.get("min_skip", "600"))
         self.compact.set(st.get("compact", True))
         self.keep_work.set(st.get("keep_work", False))
+        self.log(f"historian_repair {__version__}")
+        try:
+            from . import cache
+            old_dirs = cache.legacy_dirs(self.workdir_var.get())
+            if old_dirs:
+                self.log(f"Hinweis: {len(old_dirs)} Arbeitsordner ohne Prüfsummen-Manifest (ältere Version bzw. "
+                         f"behaltene Merge-Zwischendateien) in {self.workdir_var.get()} – werden nicht "
+                         f"wiederverwendet und können gelöscht werden: "
+                         + ", ".join(os.path.basename(d) for d in old_dirs[:6]) + (" …" if len(old_dirs) > 6 else ""))
+        except OSError:
+            pass
+        if st.get("tool_version") and st.get("tool_version") != __version__:
+            self.log(f"Einstellungen stammen von Version {st.get('tool_version')} – Änderungen siehe CHANGELOG.md")
         if sources:
             self.log(f"Einstellungen geladen: {sum(1 for x in sources if x.get('path'))} Quelle(n), "
                      f"Arbeitsverzeichnis {self.workdir_var.get()}")
+
+    def _reuse_hint(self):
+        if self.reuse.get():
+            self.log("Arbeitsdaten werden wiederverwendet, wenn die SHA-256-Prüfsumme der Quelle, die H2-Version "
+                     "und die Einstellungen übereinstimmen.")
+        else:
+            self.log("Wiederverwendung aus: Quellen werden neu kopiert, geprüft, importiert, gerettet (neu auswerten).")
+        self.save()
+
+    def check_target(self):
+        from . import checks
+        init = self.out_path.get() if os.path.exists(self.out_path.get()) else ""
+        p = filedialog.askopenfilename(
+            title="Datenbank für CCU-Historian prüfen", initialdir=os.path.dirname(init) or None,
+            initialfile=os.path.basename(init) if init else None,
+            filetypes=[("H2 Datenbank", "*.mv.db"), ("Alle Dateien", "*.*")])
+        if not p:
+            return
+        try:
+            info = E.inspect_db_file(p)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("Ziel prüfen", str(e))
+            return
+        disp = self.jars.best_for_format(info.fmt, info.kind) or self.target_jar.get()
+        jar = self.jars.paths.get(disp)
+        if not jar:
+            messagebox.showwarning("Ziel prüfen", "Kein passendes H2-JAR vorhanden ('H2 laden…').")
+            return
+        workdir, reuse = self.workdir(), self.reuse.get()
+        user, pw = self.t_user.get().strip() or E.HISTORIAN_DEFAULT_USER, self.t_password.get()
+        w = self.worker
+
+        def task():
+            return checks.check_historian_target(p, jar, user, pw, workdir, w.progress, w.cancel, reuse)
+
+        def done(res):
+            self.log(res.text())
+            self.nb.select(2)
+            (messagebox.showinfo if not res.errors else messagebox.showwarning)(
+                "Ziel prüfen", res.text()[:3000])
+
+        w.submit(task, done, lambda e, tb: (self.log(tb), messagebox.showerror("Ziel prüfen",
+                                                                           E.java_error_text(e)[:800])),
+                 f"Prüfe {p} für CCU-Historian")
 
     def open_all(self):
         todo = [sl for sl in self.slots if sl.path.get() and sl.db is None]

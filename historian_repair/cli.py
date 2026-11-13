@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 
+from . import __version__
 from . import h2engine as E
 
 
@@ -42,7 +43,7 @@ def cmd_info(a) -> int:
         if not a.jar:
             return 0
         wd = a.workdir or os.path.join(os.path.dirname(os.path.abspath(a.db)), "historian_repair_work")
-        db = E.open_source("A", a.db, a.jar, a.user, a.password, wd, _progress)
+        db = E.open_source("A", a.db, a.jar, a.user, a.password, wd, _progress, reuse=not a.no_reuse)
         return _print_db(db, a)
     info = E.inspect_db_file(a.db)
     print(f"Datei:   {info.path}")
@@ -56,7 +57,7 @@ def cmd_info(a) -> int:
     if not a.jar:
         return 0
     wd = a.workdir or os.path.join(os.path.dirname(info.path), "historian_repair_work")
-    db = E.open_source("A", a.db, a.jar, a.user, a.password, wd, _progress)
+    db = E.open_source("A", a.db, a.jar, a.user, a.password, wd, _progress, reuse=not a.no_reuse)
     return _print_db(db, a)
 
 
@@ -85,7 +86,7 @@ def _print_db(db, a) -> int:
 
 def cmd_recover(a) -> int:
     wd = a.workdir or os.path.join(os.path.dirname(os.path.abspath(a.db)), "historian_repair_work")
-    out = E.recover_database(a.db, a.jar, wd, a.user, a.password, _progress)
+    out = E.recover_database(a.db, a.jar, wd, a.user, a.password, _progress, reuse=not a.no_reuse)
     print("Wiederhergestellte Datenbank:", out)
     return 0
 
@@ -94,10 +95,21 @@ def cmd_carve(a) -> int:
     from . import carve as C
     wd = a.workdir or os.path.join(os.path.dirname(os.path.abspath(a.db)), "historian_repair_work")
     print(C.analyze_mvstore(a.db).text())
-    out, rep = C.carve_database(a.db, a.jar, wd, a.user, a.password, _progress)
+    out, rep = C.carve_database(a.db, a.jar, wd, a.user, a.password, _progress, reuse=not a.no_reuse)
     print(rep.text())
     print("Neue Datenbank mit geretteten Daten:", out)
     return 0
+
+
+def cmd_check(a) -> int:
+    from . import checks
+    wd = a.workdir or os.path.join(os.path.dirname(os.path.abspath(a.db)), "historian_repair_work")
+    jar = a.jar
+    if not jar:
+        raise SystemExit("--jar angeben (für CCU-Historian 3.0.3–4.2.x: jars/h2-2.1.214.jar)")
+    res = checks.check_historian_target(a.db, jar, a.user, a.password, wd, _progress, reuse=not a.no_reuse)
+    print(res.text())
+    return 0 if not res.errors else 2
 
 
 def cmd_merge(a) -> int:
@@ -115,7 +127,7 @@ def cmd_merge(a) -> int:
     try:
         for lab, spec in zip(labels, a.src):
             path, jar = _split_src(spec, a.jar)
-            db = E.open_source(lab, path, jar, a.user, a.password, wd, _progress)
+            db = E.open_source(lab, path, jar, a.user, a.password, wd, _progress, reuse=not a.no_reuse)
             db.scan(_progress)
             mn, mx, total = db.overall_range()
             print(f"{lab}: {path}  {E.ms_to_str(mn)} .. {E.ms_to_str(mx)}  Zeilen={total}")
@@ -149,6 +161,9 @@ def cmd_merge(a) -> int:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="historian_repair",
                                 description="CCU-Historian H2-Datenbanken analysieren, retten und zusammenführen")
+    p.add_argument("--version", action="version", version=f"historian_repair {__version__}")
+    p.add_argument("--no-reuse", action="store_true",
+                   help="vorhandene Arbeitsdaten nicht wiederverwenden (alles neu auswerten)")
     p.add_argument("--jvm", help="Java: Pfad zur jvm.dll/libjvm.so oder Java-Verzeichnis (optional, sonst automatisch)")
     p.add_argument("--xmx", help="max. Java-Heap, z.B. 2g")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -177,6 +192,14 @@ def main(argv=None) -> int:
     common(sp)
     sp.set_defaults(fn=cmd_carve)
 
+    sp = sub.add_parser("check", help="fertige Datenbank auf Tauglichkeit für CCU-Historian 4.1.3 prüfen")
+    sp.add_argument("db")
+    sp.add_argument("--jar", help="H2-JAR passend zur Datei (Format 2: h2-2.1.214.jar)")
+    sp.add_argument("--user", default=E.HISTORIAN_DEFAULT_USER)
+    sp.add_argument("--password", default=E.HISTORIAN_DEFAULT_PASSWORD)
+    sp.add_argument("--workdir")
+    sp.set_defaults(fn=cmd_check)
+
     sp = sub.add_parser("merge", help="Neue DB aus Quellen erzeugen (Reihenfolge = Priorität)")
     sp.add_argument("--src", action="append", required=True, help="PFAD[@JAR], mehrfach; PFAD darf .mv.db, .h2.db oder .zip (Backup) sein")
     sp.add_argument("--jar", help="Standard-JAR für alle Quellen")
@@ -203,7 +226,7 @@ def main(argv=None) -> int:
     except RuntimeError as e:
         print(f"FEHLER: {e}")
         return 3
-    print(f"Verwende {j.text()}")
+    print(f"historian_repair {__version__} – verwende {j.text()}")
     t0 = time.time()
     rc = a.fn(a)
     print(f"({time.time() - t0:.1f} s)")

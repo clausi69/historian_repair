@@ -641,7 +641,10 @@ class Ticker:
 
 
 def copy_with_progress(src: str, dst: str, progress: ProgressCb, text: str,
-                       cancel: Optional[threading.Event] = None) -> None:
+                       cancel: Optional[threading.Event] = None) -> str:
+    """Copy a file and return the SHA-256 of its content (computed in the same pass)."""
+    import hashlib
+    h = hashlib.sha256()
     total = os.path.getsize(src)
     done = 0
     last = 0.0
@@ -653,6 +656,7 @@ def copy_with_progress(src: str, dst: str, progress: ProgressCb, text: str,
             if not b:
                 break
             fo.write(b)
+            h.update(b)
             done += len(b)
             now = time.time()
             if now - last >= 0.5:
@@ -661,6 +665,7 @@ def copy_with_progress(src: str, dst: str, progress: ProgressCb, text: str,
                 progress(f"{text}: {fmt_mb(done)} von {fmt_mb(total)} ({rate / 1e6:.0f} MB/s)",
                          None, True)
     shutil.copystat(src, dst)
+    return h.hexdigest()
 
 
 def _check_cancel(cancel: Optional[threading.Event]) -> None:
@@ -675,8 +680,11 @@ def _check_cancel(cancel: Optional[threading.Event]) -> None:
 class Database:
     def __init__(self, label: str, file_path: str, jar: str, user: str = "sa",
                  password: str = "", workdir: str = ".", copy: bool = True,
-                 url_options: str = ""):
+                 url_options: str = "", reuse: bool = True):
         self.label = label
+        self.reuse = reuse                    # reuse verified work data (see cache.py)
+        self.source_sha: Optional[str] = None  # SHA-256 of the original source file
+        self.reuse_info: str = ""
         self.info = inspect_db_file(file_path)
         self.jar = jar
         self.user = user
@@ -716,23 +724,36 @@ class Database:
         if self.info.kind == "page" and not self.driver.v1:
             raise RuntimeError("PageStore-Dateien (.h2.db) können nur mit H2 1.x geöffnet werden.")
         ext = ".mv.db" if self.info.kind == "mv" else ".h2.db"
+        from . import cache
         if self.copy:
-            dest_dir = os.path.join(self.workdir, f"src_{self.label}")
-            os.makedirs(dest_dir, exist_ok=True)
-            name = os.path.basename(self.info.base)
-            self.copy_base = os.path.join(dest_dir, name)
-            dest = self.copy_base + ext
-            if os.path.exists(dest):
-                os.remove(dest)
-            progress(f"{self.label}: kopiere {self.info.path} ({fmt_mb(self.info.size)}) ins Arbeitsverzeichnis",
-                     None)
-            copy_with_progress(self.info.path, dest, progress, f"{self.label}: kopiere")
-            if self.info.kind == "mv":
-                # verify that the copy is identical in size
-                if os.path.getsize(dest) != self.info.size:
+            r = cache.Reuse(self.workdir, self.info.path, self.reuse, progress)
+            found, why = r.find("copy", "-", {"kind": self.info.kind})
+            if found:
+                self.copy_base = found[:-len(ext)]
+                self.reuse_info = why
+                progress(f"{self.label}: Kopie {why}", None)
+            else:
+                if self.reuse and not why.startswith("keine"):
+                    progress(f"{self.label}: Kopie {why}", None)
+                dest_dir = unique_dir(self.workdir, "copy")
+                self.copy_base = os.path.join(dest_dir, os.path.basename(self.info.base))
+                dest = self.copy_base + ext
+                progress(f"{self.label}: kopiere {self.info.path} ({fmt_mb(self.info.size)}) ins "
+                         f"Arbeitsverzeichnis und berechne SHA-256", None)
+                sha = copy_with_progress(self.info.path, dest, progress, f"{self.label}: kopiere")
+                if os.path.getsize(dest) != self.info.size or file_fingerprint(self.info.path) != \
+                        self.original_fingerprint:
                     raise RuntimeError("Kopie unvollständig (Datei wurde während des Kopierens verändert?)")
+                r.set_sha256(sha)
+                r.store(dest_dir, "copy", "-", dest, {"kind": self.info.kind})
+                cache.remove_stale(self.workdir, "copy", self.info.path, keep=dest_dir)
+            self.source_sha = r.sha256()
+            progress(f"{self.label}: SHA-256 der Quelle {self.source_sha}", None)
         else:
             self.copy_base = self.info.base
+            m = cache.read_manifest(os.path.dirname(self.info.path))
+            if m and self.source_sha is None:
+                self.source_sha = (m.get("source") or {}).get("sha256")
         if self.info.kind == "mv":
             try:
                 from .carve import analyze_mvstore
@@ -919,8 +940,27 @@ class Database:
                    min_skip_ms: int = 600_000) -> dict[str, tuple[int, list[tuple[int, int]]]]:
         """Read every row of every data table. Returns {table: (rows_read, lost_intervals)}.
 
-        Tables with unreadable parts get TableInfo.error set.
+        Tables with unreadable parts get TableInfo.error set. The result is stored in the work
+        directory (keyed by the SHA-256 of the source) and reused if the source is unchanged.
         """
+        from . import cache
+        r_cache = None
+        extra = {"min_skip_ms": min_skip_ms}
+        if self.source_sha and os.path.exists(self.origin):
+            r_cache = cache.Reuse(self.workdir, self.origin, self.reuse, progress, cancel, self.source_sha)
+            found, why = r_cache.find("check", self.driver.version, extra)
+            if found:
+                with open(found, encoding="utf-8") as f:
+                    stored = json.load(f)
+                res = {k: (v[0], [tuple(x) for x in v[1]]) for k, v in stored["result"].items()}
+                for name, err in stored.get("errors", {}).items():
+                    if name in self.tables:
+                        self.tables[name].error = err
+                self.reuse_info = why
+                progress(f"{self.label}: Prüfergebnis {why}", None)
+                return res
+            if self.reuse and not why.startswith("keine"):
+                progress(f"{self.label}: Prüfergebnis {why}", None)
         res = {}
         data = [t for t in self.tables.values() if t.is_data]
         for i, t in enumerate(data):
@@ -943,6 +983,12 @@ class Database:
             if r.lost or (t.count is not None and n != t.count):
                 t.error = (f"{len(r.lost)} unlesbare Bereiche, {n} von {t.count} Werten lesbar: "
                            + "; ".join(f"{ms_to_str(a)}..{ms_to_str(b)}" for a, b in r.lost[:5]))
+        if r_cache is not None:
+            d = unique_dir(self.workdir, "check")
+            out = os.path.join(d, "check.json")
+            with open(out, "w", encoding="utf-8") as f:
+                json.dump({"result": res, "errors": {t.name: t.error for t in data if t.error}}, f)
+            r_cache.store(d, "check", self.driver.version, out, extra)
         return res
 
     def count_range(self, table: str, lo: Optional[int], hi: Optional[int]) -> int:
@@ -1020,14 +1066,24 @@ def inspect_zip(path: str) -> ZipSourceInfo:
 
 def import_zip_source(path: str, jar: str, workdir: str, user: str = "sa", password: str = "",
                       progress: ProgressCb = _noop_progress,
-                      cancel: Optional[threading.Event] = None) -> tuple[str, ZipSourceInfo]:
+                      cancel: Optional[threading.Event] = None,
+                      reuse: bool = True) -> tuple[str, ZipSourceInfo, str]:
     """Extract a zip backup into the work directory and return a .mv.db/.h2.db to open.
 
     A SQL script is imported with RUNSCRIPT into a new database (FROM_1X when a
     1.x script is imported with an H2 2.x jar). The zip itself is only read.
     """
+    from . import cache
     zi = inspect_zip(path)
     drv = H2Driver.get(jar)
+    r = cache.Reuse(workdir, path, reuse, progress, cancel)
+    extra = {"entry": zi.entry, "user": user}
+    found, why = r.find("zip", drv.version, extra)
+    if found:
+        progress(f"ZIP-Import {why}", None)
+        return found, zi, r.sha256()
+    if reuse and not why.startswith("keine"):
+        progress(f"ZIP-Import {why}", None)
     zdir = unique_dir(workdir, "zip")
     target = os.path.join(zdir, os.path.basename(zi.entry))
     progress(f"ZIP: entpacke {zi.entry} ({fmt_mb(zi.size)})", None)
@@ -1060,7 +1116,8 @@ def import_zip_source(path: str, jar: str, workdir: str, user: str = "sa", passw
                 done += len(b)
                 progress(f"ZIP: entpacke {fmt_mb(done)} von {fmt_mb(zi.size)}", done / max(1, zi.size), True)
     if zi.kind == "db":
-        return target, zi
+        r.store(zdir, "zip", drv.version, target, extra)
+        return target, zi, r.sha256()
     sv = zi.script_version
     if sv is not None and drv.v1:
         raise RuntimeError(f"Das Skript stammt von H2 {sv}; bitte ein H2-2.x-JAR (>= {sv}) wählen.")
@@ -1100,21 +1157,23 @@ def import_zip_source(path: str, jar: str, workdir: str, user: str = "sa", passw
     os.remove(target)
     progress(f"ZIP: Import fertig nach {fmt_dur(time.time() - t0)} "
              f"(Datenbank {fmt_mb(os.path.getsize(base + '.mv.db'))})", None)
-    return base + ".mv.db", zi
+    r.store(zdir, "zip", drv.version, base + ".mv.db", extra)
+    return base + ".mv.db", zi, r.sha256()
 
 
 def open_source(label: str, path: str, jar: str, user: str = "sa", password: str = "",
                 workdir: str = ".", progress: ProgressCb = _noop_progress,
-                cancel: Optional[threading.Event] = None) -> "Database":
+                cancel: Optional[threading.Event] = None, reuse: bool = True) -> "Database":
     """Open a source given as .mv.db/.h2.db or as .zip backup (always via a copy)."""
     if path.lower().endswith(".zip"):
-        dbpath, zi = import_zip_source(path, jar, workdir, user, password, progress, cancel)
-        db = Database(label, dbpath, jar, user, password, workdir, copy=False)
+        dbpath, zi, sha = import_zip_source(path, jar, workdir, user, password, progress, cancel, reuse)
+        db = Database(label, dbpath, jar, user, password, workdir, copy=False, reuse=reuse)
+        db.source_sha = sha
         db.set_origin(path)
         db.recovered_from = os.path.abspath(path)
         db.zip_info = zi
     else:
-        db = Database(label, path, jar, user, password, workdir)
+        db = Database(label, path, jar, user, password, workdir, reuse=reuse)
     db.open(progress)
     return db
 
@@ -1124,19 +1183,28 @@ def open_source(label: str, path: str, jar: str, user: str = "sa", password: str
 # ---------------------------------------------------------------------------
 
 def recover_database(file_path: str, jar: str, workdir: str, user: str = "sa", password: str = "",
-                     progress: ProgressCb = _noop_progress) -> str:
+                     progress: ProgressCb = _noop_progress, cancel: Optional[threading.Event] = None,
+                     reuse: bool = True) -> str:
     """Run org.h2.tools.Recover on a copy and import the script into a new DB.
 
     Returns the path of the recovered .mv.db (inside workdir). The original
     file is not touched.
     """
+    from . import cache
     info = inspect_db_file(file_path)
     drv = H2Driver.get(jar)
+    r = cache.Reuse(workdir, info.path, reuse, progress, cancel)
+    found, why = r.find("recover", drv.version, {"user": user})
+    if found:
+        progress(f"Recover {why}", None)
+        return found
+    if reuse and not why.startswith("keine"):
+        progress(f"Recover {why}", None)
     rdir = unique_dir(workdir, "recover")
     name = os.path.basename(info.base)
     ext = ".mv.db" if info.kind == "mv" else ".h2.db"
-    progress(f"Recover: kopiere {file_path} ...", None)
-    shutil.copyfile(info.path, os.path.join(rdir, name + ext))
+    progress(f"Recover: kopiere {file_path} ({fmt_mb(info.size)}) und berechne SHA-256", None)
+    r.set_sha256(copy_with_progress(info.path, os.path.join(rdir, name + ext), progress, "Recover: kopiere", cancel))
     progress(f"Recover: H2 {drv.version} org.h2.tools.Recover läuft (kann dauern) ...", None)
     with Ticker(progress, "Recover: lese defekte Datenbank", rdir):
         drv.run_tool("org.h2.tools.Recover", ["-dir", rdir, "-db", name])
@@ -1151,10 +1219,12 @@ def recover_database(file_path: str, jar: str, workdir: str, user: str = "sa", p
             execute(conn, f"RUNSCRIPT FROM '{script.replace(chr(39), chr(39) * 2)}'")
     finally:
         conn.close()
-    try:
-        os.remove(os.path.join(rdir, name + ext))  # remove the defective copy
-    except OSError:
-        pass
+    for f in (os.path.join(rdir, name + ext), script):   # defective copy and (large) script
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    r.store(rdir, "recover", drv.version, newbase + ".mv.db", {"user": user})
     progress("Recover: fertig", None)
     return newbase + ".mv.db"
 
@@ -1225,7 +1295,8 @@ class MergeReport:
         lost = [s for s in self.stats if s.lost]
         errs = [s for s in self.stats if s.errors]
         bad = {k: v for k, v in self.verify.items() if v[0] != v[1]}
-        L = [f"Ergebnis: {self.output_path}",
+        from . import __version__
+        L = [f"Ergebnis: {self.output_path}  (historian_repair {__version__})",
              f"Status: {'OK' if self.ok else 'FEHLER/WARNUNGEN'}, Dauer {fmt_dur(self.duration_s)}",
              f"Werte: {fmt_n(tot[0])} gelesen, {fmt_n(tot[1])} geschrieben, {fmt_n(tot[2])} Duplikate, "
              f"{fmt_n(tot[3])} wegen Zeitraum-Priorität übersprungen, {fmt_n(tot[4])} nicht schreibbar",
@@ -1245,7 +1316,9 @@ class MergeReport:
         return "\n".join(L)
 
     def text(self) -> str:
-        L = [f"Ergebnis: {self.output_path}", f"Dauer: {self.duration_s:.1f} s",
+        from . import __version__
+        L = [f"Ergebnis: {self.output_path}", f"Erstellt mit historian_repair {__version__}",
+             f"Dauer: {self.duration_s:.1f} s",
              f"Status: {'OK' if self.ok else 'FEHLER/WARNUNGEN'}", ""]
         L.append("Quelldateien unverändert: " + ", ".join(
             f"{k}={'ja' if v else 'NEIN'}" for k, v in self.sources_unchanged.items()))
@@ -1341,6 +1414,7 @@ class MergeJob:
             self._copy_other_tables()
             self._merge_datapoints()
             self._merge_data()
+            self._create_missing_dp_tables()
             self._drop_temp_indexes()
             self.tconn.commit()
             self.progress("Schließe neue Datenbank" + (" (Kompaktierung)" if self.opts.compact else ""), 0.97)
@@ -1573,6 +1647,29 @@ class MergeJob:
                 found = True
         rs.close()
         return found
+
+    def _create_missing_dp_tables(self) -> None:
+        """Every DATA_POINTS entry needs its data table: CCU-Historian (prepareDataPoint) only creates
+        tables for new data points, writing to a known data point without table would fail."""
+        if DATA_POINTS not in self._target_tables():
+            return
+        tcols = [c.upper() for c in self._target_columns(DATA_POINTS)]
+        if "TABLE_NAME" not in tcols:
+            return
+        existing = self._target_tables()
+        missing = sorted({str(r[0]) for r in query_all(self.tconn, f"SELECT TABLE_NAME FROM {q(DATA_POINTS)}")
+                          if r[0] is not None} - existing)
+        for t in missing:
+            vt = "VARCHAR" if t.startswith("C_") else "DOUBLE"
+            # same definition as CCU-Historian Database.createDataPointTable()
+            execute(self.tconn, f'CREATE TABLE IF NOT EXISTS {q(t)} ("TS" TIMESTAMP, "VALUE" {vt}, "STATE" INT)')
+            execute(self.tconn, f'CREATE INDEX IF NOT EXISTS {q(t + "_IDX")} ON {q(t)} ("TS")')
+        self.tconn.commit()
+        if missing:
+            self.report.warnings.append(f"{len(missing)} Datenpunkte ohne Daten in allen Quellen – leere Tabellen "
+                                        f"angelegt (wie der Historian bei neuen Datenpunkten): "
+                                        + ", ".join(missing[:5]) + (" …" if len(missing) > 5 else ""))
+            self.progress(f"{len(missing)} Datenpunkte ohne Verlauf in den Quellen – leere Tabellen angelegt", None)
 
     def _drop_temp_indexes(self) -> None:
         for idx in self._temp_indexes:

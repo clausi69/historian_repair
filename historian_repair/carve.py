@@ -125,9 +125,15 @@ class CarveReport:
     tables: dict = field(default_factory=dict)       # name -> (rows, min_ms, max_ms)
     statements_failed: list = field(default_factory=list)
     unnamed_tables: list = field(default_factory=list)
+    reused_text: str = ""
+    reused_info: str = ""
     debug: dict = field(default_factory=dict)
 
     def text(self, max_tables: Optional[int] = None) -> str:
+        if self.reused_info:
+            lines = self.reused_text.strip().splitlines()
+            head = lines[:3 + (max_tables or len(lines))] if max_tables else lines
+            return f"Carving {self.reused_info}\n" + "\n".join(head)
         L = [f"Carving-Ergebnis: {self.output}",
              f"Maps bekannt: {self.maps_known}, Seiten gefunden: {self.pages_found}, "
              f"Tabellen-Blattseiten dekodiert: {self.pages_decoded}, fehlgeschlagen: {self.pages_failed}",
@@ -176,7 +182,7 @@ _TYPE_ORDER = {3: 0, 9: 1, 0: 2, 1: 3, 5: 4}   # sequence, alias, table, index, 
 
 def carve_database(file_path: str, jar: str, workdir: str, user: str = "sa", password: str = "",
                    progress: E.ProgressCb = E._noop_progress,
-                   cancel: Optional[threading.Event] = None) -> tuple[str, CarveReport]:
+                   cancel: Optional[threading.Event] = None, reuse: bool = True) -> tuple[str, CarveReport]:
     import jpype
     import numpy as np
 
@@ -191,10 +197,25 @@ def carve_database(file_path: str, jar: str, workdir: str, user: str = "sa", pas
     def J(n):
         return jpype.JClass(n, loader=L)
 
+    from . import cache
+    r_cache = cache.Reuse(workdir, info.path, reuse, progress, cancel)
+    found, why = r_cache.find("carve", drv.version, {"user": user})
+    if found:
+        progress(f"Carving {why}", None)
+        rep = CarveReport(output=found)
+        try:
+            with open(os.path.join(os.path.dirname(found), "carve_report.txt"), encoding="utf-8") as f:
+                rep.reused_text = f.read()
+        except OSError:
+            rep.reused_text = ""
+        rep.reused_info = why
+        return found, rep
+    if reuse and not why.startswith("keine"):
+        progress(f"Carving {why}", None)
     rdir = E.unique_dir(workdir, "carve")
     src = os.path.join(rdir, "source_copy.mv.db")
-    progress(f"Carving: kopiere {file_path} ({E.fmt_mb(info.size)})", None)
-    E.copy_with_progress(info.path, src, progress, "Carving: kopiere", cancel)
+    progress(f"Carving: kopiere {file_path} ({E.fmt_mb(info.size)}) und berechne SHA-256", None)
+    r_cache.set_sha256(E.copy_with_progress(info.path, src, progress, "Carving: kopiere", cancel))
     rep = CarveReport()
 
     # -- 1. chunks + meta ----------------------------------------------------
@@ -486,6 +507,7 @@ def carve_database(file_path: str, jar: str, workdir: str, user: str = "sa", pas
     rep.output = newbase + ".mv.db"
     with open(os.path.join(rdir, "carve_report.txt"), "w", encoding="utf-8") as f:
         f.write(rep.text() + "\n")
+    r_cache.store(rdir, "carve", drv.version, rep.output, {"user": user})
     progress(f"Carving: fertig – {len(rep.tables)} Tabellen, {E.fmt_n(sum(v[0] for v in rep.tables.values()))} "
              f"Werte gerettet", 1.0)
     return rep.output, rep

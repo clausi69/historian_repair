@@ -123,6 +123,35 @@ Datenbankzugriffe aus `Database.groovy` von v4.1.3 wörtlich mit H2 2.1.214 und
 derselben JDBC-URL nach (Start/Migration, Lesen aller Datenpunkte, Anlegen von
 Tabelle/Index/Datenpunkt, Schreiben). Er führt nicht den Historian selbst aus.
 
+## Arbeitsdaten wiederverwenden (ab 0.7.0)
+
+Beim Öffnen wird jede Quelldatei ins Arbeitsverzeichnis kopiert; dabei wird im
+selben Lesedurchgang ihre **SHA-256-Prüfsumme** berechnet. Kopien, ZIP-Importe,
+Prüfergebnisse, Recover- und Carving-Ergebnisse bekommen ein `manifest.json`
+(Prüfsumme der Quelle, H2-Version, Einstellungen, Tool-Version,
+Verarbeitungsformat, Größe/Zeitstempel des Ergebnisses).
+
+Beim nächsten Mal wird ein Ergebnis nur wiederverwendet, wenn
+Prüfsumme der Quelle, H2-Version, Einstellungen und Verarbeitungsformat
+übereinstimmen **und** das Ergebnis seitdem unverändert ist. Dazu muss die
+Quelle einmal gelesen werden (Prüfsumme), das Kopieren/Importieren/Carving
+entfällt. Im Protokoll steht jeweils, was wiederverwendet wurde und warum
+etwas nicht wiederverwendet werden konnte.
+
+Haken **„Arbeitsdaten wiederverwenden“** aus (bzw. `--no-reuse`) = alles neu
+auswerten. Arbeitsordner älterer Versionen (ohne Manifest) werden nie
+verwendet; das Tool weist beim Start darauf hin, sie können gelöscht werden.
+
+## Ziel prüfen (ab 0.7.0)
+
+**„Ziel prüfen…“** (bzw. `python3 -m historian_repair check DATEI --jar jars/h2-2.1.214.jar`)
+prüft eine fertige Datenbank – auch eine mit einer älteren Tool-Version
+erzeugte – nur lesend auf einer Kopie gegen die Anforderungen von
+CCU-Historian 4.1.3: Dateiformat, Anmeldung (Benutzer/Passwort aus dem
+Zielbereich), `CONFIG`/Datenbankversion, `DATA_POINTS`-Spalten, doppelte
+Datenpunkte, nächste `DP_ID`, vorhandene Datentabellen und Werttypen,
+TS-Indizes, Funktionen `TS_TO_UNIX`/`UNIX_TO_TS`.
+
 ## Ablauf (typischer Rettungsfall)
 
 1. **CCU-Historian stoppen** (bzw. Datenbankdatei vorher wegkopieren). Liegt
