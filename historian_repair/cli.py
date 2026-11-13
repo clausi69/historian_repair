@@ -124,7 +124,13 @@ def cmd_merge(a) -> int:
                 sel = {n for n, t in db.tables.items() if t.is_data and tables_re.search(n)}
             lo, hi = ranges.get(lab, (None, None))
             specs.append(E.SourceSpec(db, sel, lo, hi))
-        opts = E.MergeOptions(output_path=out, target_jar=a.target_jar or _split_src(a.src[0], a.jar)[1],
+        tjar = a.target_jar or _split_src(a.src[0], a.jar)[1]
+        tver = E.jar_version(tjar)
+        if tver != E.HISTORIAN_H2[0][1]:
+            print(f"WARNUNG: Ziel wird mit H2 {tver} geschrieben. CCU-Historian 3.0.3–4.2.x verwendet "
+                  f"H2 {E.HISTORIAN_H2[0][1]} und kann Dateien anderer H2-Versionen nicht öffnen "
+                  f"(--target-jar jars/h2-{E.HISTORIAN_H2[0][1]}.jar).")
+        opts = E.MergeOptions(output_path=out, target_jar=tjar, user=a.target_user, password=a.target_password,
                               template=a.template, dedup=a.dedup, min_skip_ms=int(a.min_skip * 1000),
                               compact=not a.no_compact, overwrite=a.overwrite, keep_workdir=a.keep_workdir,
                               workdir=wd)
@@ -184,6 +190,9 @@ def main(argv=None) -> int:
     sp.add_argument("--no-compact", action="store_true")
     sp.add_argument("--overwrite", action="store_true")
     sp.add_argument("--keep-workdir", action="store_true")
+    sp.add_argument("--target-user", default=E.HISTORIAN_DEFAULT_USER, help="Benutzer der neuen DB (Standard sa)")
+    sp.add_argument("--target-password", default=E.HISTORIAN_DEFAULT_PASSWORD,
+                    help="Passwort der neuen DB (Standard ccu-historian, wie database.password im Historian)")
     common(sp)
     sp.set_defaults(fn=cmd_merge)
 

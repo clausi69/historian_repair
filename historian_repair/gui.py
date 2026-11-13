@@ -175,7 +175,7 @@ class SourceSlot:
         self.path = tk.StringVar()
         self.jar = tk.StringVar()
         self.user = tk.StringVar(value="sa")
-        self.password = tk.StringVar(value="")
+        self.password = tk.StringVar(value=E.HISTORIAN_DEFAULT_PASSWORD)
         self.t_from = tk.StringVar()
         self.t_to = tk.StringVar()
         self.active = tk.BooleanVar(value=True)
@@ -366,6 +366,17 @@ class SourceSlot:
             if isinstance(e, E.Cancelled):
                 return
             msg = E.java_error_text(e)
+            if "28000" in msg or "Wrong user name or password" in msg:
+                self.info.set("Benutzer/Passwort falsch")
+                messagebox.showerror(
+                    "Anmeldung fehlgeschlagen",
+                    f"Quelle {self.label}: Benutzer oder Passwort falsch.\n\n"
+                    f"CCU-Historian-Standard: Benutzer '{E.HISTORIAN_DEFAULT_USER}', Passwort "
+                    f"'{E.HISTORIAN_DEFAULT_PASSWORD}' (database.user / database.password in der "
+                    "ccu-historian.config). Vom Tool selbst erzeugte Dateien (Carving/Recover/ZIP-Import) "
+                    "haben das Passwort, das beim Erzeugen eingetragen war.\n\n"
+                    "Die Datei selbst ist deswegen nicht defekt.")
+                return
             if recovered_path:
                 messagebox.showerror("Fehler", msg[:1000])
                 return
@@ -513,6 +524,9 @@ class App:
             "workdir", os.path.join(os.path.expanduser("~"), "historian_repair_work")))
         self.jvm_var = tk.StringVar(value=self.settings.get("jvm", ""))
         self.save_pw = tk.BooleanVar(value=self.settings.get("save_passwords", True))
+        self.t_user = tk.StringVar(value=self.settings.get("target_user", E.HISTORIAN_DEFAULT_USER))
+        self.t_password = tk.StringVar(value=secret.unprotect(self.settings.get("target_password", ""))
+                                       or E.HISTORIAN_DEFAULT_PASSWORD)
         self.sel_slot = tk.StringVar(value="A")
         self.current_table: Optional[str] = None
         self._build()
@@ -609,8 +623,15 @@ class App:
         ttk.Entry(tg, textvariable=self.out_path, width=70).grid(row=0, column=1, columnspan=3, sticky="ew")
         ttk.Button(tg, text="…", width=3, command=self._browse_out).grid(row=0, column=4, sticky="w")
         ttk.Label(tg, text="H2-Version Ziel:").grid(row=1, column=0, sticky="w")
-        self.tjar_cb = ttk.Combobox(tg, textvariable=self.target_jar, width=40, state="readonly")
-        self.tjar_cb.grid(row=1, column=1, sticky="w")
+        tjf = ttk.Frame(tg)
+        tjf.grid(row=1, column=1, sticky="w")
+        self.tjar_cb = ttk.Combobox(tjf, textvariable=self.target_jar, width=32, state="readonly")
+        self.tjar_cb.pack(side="left")
+        ttk.Label(tjf, text="(CCU-Historian 3.0.3–4.2.x: H2 2.1.214)", foreground="#666").pack(side="left", padx=4)
+        ttk.Label(tjf, text="  Benutzer").pack(side="left")
+        ttk.Entry(tjf, textvariable=self.t_user, width=6).pack(side="left", padx=2)
+        ttk.Label(tjf, text="Passwort").pack(side="left")
+        ttk.Entry(tjf, textvariable=self.t_password, width=13, show="•").pack(side="left", padx=2)
         ttk.Label(tg, text="Schema/Meta-Tabellen aus Quelle:").grid(row=1, column=2, sticky="e")
         self.tmpl_cb = ttk.Combobox(tg, textvariable=self.template, width=4, state="readonly")
         self.tmpl_cb.grid(row=1, column=3, sticky="w")
@@ -709,13 +730,20 @@ class App:
                 p = p.rsplit(".", 1)[0] + ".mv.db" if p.endswith(".db") else p + ".mv.db"
             self.out_path.set(p)
 
+    def preferred_target_jar(self) -> Optional[str]:
+        """H2 version of the current CCU-Historian (3.0.3 - 4.2.x)."""
+        for d, p in self.jars.paths.items():
+            if self.jars.versions.get(p) == E.HISTORIAN_H2[0][1]:
+                return d
+        return None
+
     def _refresh_jar_lists(self):
         vals = list(self.jars.paths)
         for s in self.slots:
             s.jar_cb.configure(values=vals)
         self.tjar_cb.configure(values=vals)
         if not self.target_jar.get() and vals:
-            self.target_jar.set(self.jars.newest() or vals[-1])
+            self.target_jar.set(self.preferred_target_jar() or self.jars.newest() or vals[-1])
 
     def _add_jar(self):
         p = filedialog.askopenfilename(title="H2-JAR (oder ccu-historian.jar) wählen",
@@ -1111,7 +1139,9 @@ class App:
         opts = E.MergeOptions(output_path=out, target_jar=tjar, template=labels.index(self.template.get()),
                               dedup=self.dedup.get(), min_skip_ms=min_skip, compact=self.compact.get(),
                               keep_workdir=self.keep_work.get(),
-                              workdir=os.path.join(self.workdir(), "merge"))
+                              workdir=os.path.join(self.workdir(), "merge"),
+                              user=self.t_user.get().strip() or E.HISTORIAN_DEFAULT_USER,
+                              password=self.t_password.get())
         return specs, opts
 
     def preview(self):
@@ -1160,6 +1190,23 @@ class App:
         if not c:
             return
         specs, opts = c
+        tver = self.jars.versions.get(opts.target_jar)
+        want = E.HISTORIAN_H2[0][1]
+        if tver != want:
+            known = ", ".join(f"{h}: H2 {v}" for h, v in E.HISTORIAN_H2)
+            if not messagebox.askyesno(
+                    "H2-Version des Ziels",
+                    f"Die neue Datenbank wird mit H2 {tver} geschrieben.\n\n"
+                    f"CCU-Historian öffnet nur Dateien seiner eigenen H2-Version ({known}). "
+                    f"Eine Datei von H2 {tver} kann z.B. Historian 4.1.3 (H2 {want}) NICHT öffnen.\n\n"
+                    f"Trotzdem mit H2 {tver} schreiben?"
+                    + ("" if self.preferred_target_jar() else
+                       f"\n\n(h2-{want}.jar fehlt noch – über 'H2 laden…' herunterladen.)")):
+                return
+        if opts.password == "" or opts.user.upper() != "SA" or opts.password != E.HISTORIAN_DEFAULT_PASSWORD:
+            self.log(f"Hinweis: neue Datenbank mit Benutzer '{opts.user}' und "
+                     f"{'leerem' if not opts.password else 'eigenem'} Passwort – muss zu database.user/"
+                     f"database.password in der ccu-historian.config passen (Standard: sa / ccu-historian).")
         out = opts.output_path if opts.output_path.endswith(".mv.db") else opts.output_path + ".mv.db"
         if os.path.exists(out):
             if not messagebox.askyesno("Überschreiben?", f"{out}\nexistiert bereits. Überschreiben?\n"
@@ -1213,7 +1260,8 @@ class App:
                   "target_jar": self.jars.paths.get(self.target_jar.get(), ""),
                   "template_index": labels.index(self.template.get()) if self.template.get() in labels else 0,
                   "dedup": self.dedup.get(), "min_skip": self.min_skip.get(), "compact": self.compact.get(),
-                  "keep_work": self.keep_work.get()})
+                  "keep_work": self.keep_work.get(), "target_user": self.t_user.get(),
+                  "target_password": secret.protect(self.t_password.get()) if self.save_pw.get() else ""})
         return s
 
     def save(self):

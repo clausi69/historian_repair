@@ -97,6 +97,32 @@ Das Protokoll enthält nur Meilensteine, Fortschritt in 10-%-Schritten und
 Auffälligkeiten (rot); laufende Zähler (kopierte MB, geschriebene Werte,
 Laufzeit bei Kompaktierung/Skript-Import) stehen in der Statuszeile unten.
 
+## Zielsystem CCU-Historian – H2-Version und Zugangsdaten
+
+Der Historian öffnet nur Dateien **seiner** H2-Version (geprüft im Quellcode
+github.com/mdzio/ccu-historian, Verzeichnis `external-libs/`):
+
+| CCU-Historian | H2 | Dateiformat | Ziel-JAR im Tool |
+|---|---|---|---|
+| 2.2 – 2.9 | 1.4.199 | 1 | h2-1.4.199 |
+| 3.0.0 – 3.0.2 | 2.1.212 | 2 | h2-2.1.212 |
+| **3.0.3 – 4.2.x** (z. B. 4.1.3) | **2.1.214** | 2 | **h2-2.1.214** (Standard) |
+
+Eine mit H2 2.2 oder neuer (z. B. 2.5.252) geschriebene Datei kann Historian
+4.1.3 **nicht** öffnen („Unsupported database file version“). Das Tool wählt
+deshalb standardmäßig 2.1.214 und warnt vor dem Schreiben bei einer anderen
+Version.
+
+Zugangsdaten: Standard des Historian ist `sa` / `ccu-historian`
+(`database.user`/`database.password` in `ccu-historian.config`). Die neue
+Datenbank erhält die im Zielbereich eingetragenen Zugangsdaten (vorbelegt mit
+diesem Standard).
+
+Kompatibilitätstest (`tests/historian_compat.py`): spielt die
+Datenbankzugriffe aus `Database.groovy` von v4.1.3 wörtlich mit H2 2.1.214 und
+derselben JDBC-URL nach (Start/Migration, Lesen aller Datenpunkte, Anlegen von
+Tabelle/Index/Datenpunkt, Schreiben). Er führt nicht den Historian selbst aus.
+
 ## Ablauf (typischer Rettungsfall)
 
 1. **CCU-Historian stoppen** (bzw. Datenbankdatei vorher wegkopieren). Liegt

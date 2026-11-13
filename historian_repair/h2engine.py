@@ -36,7 +36,16 @@ log = logging.getLogger("historian_repair")
 # Constants / helpers
 # ---------------------------------------------------------------------------
 
-H2_DOWNLOAD_VERSIONS = ["1.4.200", "2.1.214", "2.2.224", "2.3.232", "2.4.240", "2.5.252"]
+H2_DOWNLOAD_VERSIONS = ["1.4.199", "1.4.200", "2.1.212", "2.1.214", "2.2.224", "2.3.232", "2.4.240", "2.5.252"]
+
+# H2 version bundled with CCU-Historian (github.com/mdzio/ccu-historian, external-libs/)
+HISTORIAN_H2 = [
+    ("CCU-Historian 3.0.3 – 4.2.x", "2.1.214"),
+    ("CCU-Historian 3.0.0 – 3.0.2", "2.1.212"),
+    ("CCU-Historian 2.2 – 2.9", "1.4.199"),
+]
+HISTORIAN_DEFAULT_USER = "sa"
+HISTORIAN_DEFAULT_PASSWORD = "ccu-historian"   # DatabaseConfig.groovy
 MAVEN_URL = "https://repo1.maven.org/maven2/com/h2database/h2/{v}/h2-{v}.jar"
 
 FORMAT_TEXT = {
@@ -411,10 +420,11 @@ class H2Driver:
 
     _cache: dict[str, "H2Driver"] = {}
 
-    def __init__(self, jar: str):
+    def __init__(self, jar: str, extra_classpath: Optional[list[str]] = None):
         import jpype
         start_jvm()
         self.jar = os.path.abspath(jar)
+        self.extra_classpath = [os.path.abspath(p) for p in (extra_classpath or [])]
         if not os.path.isfile(self.jar):
             raise FileNotFoundError(self.jar)
         URLClassLoader = jpype.JClass("java.net.URLClassLoader")
@@ -425,7 +435,8 @@ class H2Driver:
             parent = ClassLoader.getPlatformClassLoader()          # Java 9+
         except AttributeError:
             parent = ClassLoader.getSystemClassLoader().getParent()  # Java 8: extension loader
-        self.loader = URLClassLoader([File(self.jar).toURI().toURL()], parent)
+        urls = [File(p).toURI().toURL() for p in [self.jar] + self.extra_classpath]
+        self.loader = URLClassLoader(urls, parent)
         self._Class = Class
         drv_cls = Class.forName("org.h2.Driver", True, self.loader)
         self.driver = drv_cls.getDeclaredConstructor().newInstance()
@@ -439,10 +450,10 @@ class H2Driver:
         self.fmt = format_for_version(self.version)
 
     @classmethod
-    def get(cls, jar: str) -> "H2Driver":
-        key = os.path.abspath(jar)
+    def get(cls, jar: str, extra_classpath: Optional[list[str]] = None) -> "H2Driver":
+        key = os.path.abspath(jar) + "|" + "|".join(extra_classpath or [])
         if key not in cls._cache:
-            cls._cache[key] = H2Driver(key)
+            cls._cache[key] = H2Driver(jar, extra_classpath)
         return cls._cache[key]
 
     @property
@@ -1368,6 +1379,18 @@ class MergeJob:
                                      "WHERE TABLE_SCHEMA = 'PUBLIC'")
         return {str(r[0]) for r in rows if str(r[1]).upper() in ("TABLE", "BASE TABLE")}
 
+    def _target_object_names(self) -> set:
+        """Names of indexes and constraints in the target (schema-wide namespaces in H2)."""
+        names = set()
+        for sql in ("SELECT INDEX_NAME FROM INFORMATION_SCHEMA.INDEXES WHERE TABLE_SCHEMA = 'PUBLIC'",
+                    "SELECT CONSTRAINT_NAME FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS WHERE TABLE_SCHEMA = 'PUBLIC'",
+                    "SELECT CONSTRAINT_NAME FROM INFORMATION_SCHEMA.CONSTRAINTS WHERE CONSTRAINT_SCHEMA = 'PUBLIC'"):
+            try:
+                names |= {str(r[0]).upper() for r in query_all(self.tconn, sql)}
+            except Exception:  # noqa: BLE001  (table differs between H2 1.4 and 2.x)
+                pass
+        return names
+
     def _target_columns(self, table: str) -> list[str]:
         md = self.tconn.getMetaData()
         rs = md.getColumns(None, "PUBLIC", table, None)
@@ -1411,7 +1434,20 @@ class MergeJob:
             if "SEQUENCE" in up and not up.startswith("CREATE"):
                 continue
 
+            existing = self._target_object_names()
+            # TS index of a data table: use the CCU-Historian name "<table>_IDX" (it creates that one
+            # with IF NOT EXISTS on start; a differently named index would be duplicated)
+            mi = re.match(r'CREATE INDEX "PUBLIC"\."([^"]+)" ON "PUBLIC"\."([^"]+)"\("TS"[^,)]*\)', s)
+            if mi and mi.group(2) == table and src.tables.get(table) and src.tables[table].is_data:
+                want = f"{table}_IDX"
+                if want.upper() not in existing and mi.group(1) != want:
+                    s = s.replace(f'"PUBLIC"."{mi.group(1)}"', f'"PUBLIC"."{want}"', 1)
+
             def ren(m):
+                # keep e.g. "<table>_IDX" (CCU-Historian creates it with IF NOT EXISTS); rename on collision only
+                if m.group(2).upper() not in existing:
+                    existing.add(m.group(2).upper())
+                    return m.group(0)
                 self._name_counter += 1
                 return f'{m.group(1)}"PUBLIC"."HR_{self._name_counter}_{m.group(2)}"'
             stmts.append(_NAME_RE.sub(ren, s))
@@ -1479,7 +1515,9 @@ class MergeJob:
         existing_ids: set = set()
         ins = self.tconn.prepareStatement(
             f"INSERT INTO {q(DATA_POINTS)} ({', '.join(q(c) for c in tcols)}) "
-            f"VALUES ({', '.join('?' * len(tcols))})")
+            # CCU-Historian 3.x/4.x: DP_ID is GENERATED ALWAYS AS IDENTITY -> explicit ids need this clause
+            + ("OVERRIDING SYSTEM VALUE " if (idcol and not self.tdrv.v1) else "")
+            + f"VALUES ({', '.join('?' * len(tcols))})")
         total = 0
         for s in srcs:
             if s.db.tables[DATA_POINTS].error:
@@ -1494,6 +1532,10 @@ class MergeJob:
                     continue
                 raw = dp.get("_RAW", {})
                 row = {c: raw.get(c.upper()) for c in tcols}
+                if "TABLE_NAME" in up and row[tcols[up.index("TABLE_NAME")]] is None:
+                    # source from a Historian version without TABLE_NAME (NOT NULL in 3.x/4.x)
+                    row[tcols[up.index("TABLE_NAME")]] = dp.get("_TABLE") or historian_table_name(
+                        dp.get("INTERFACE", ""), dp.get("ADDRESS", ""), dp.get("IDENTIFIER", ""))
                 if idcol is not None and row[idcol] is not None:
                     row[idcol] = py(row[idcol])
                     if row[idcol] in existing_ids:

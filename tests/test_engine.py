@@ -200,3 +200,45 @@ def test_zip_sources(dbs):
     Y.close()
     assert rep.ok, rep.text()
     assert all(rep.sources_unchanged.values())
+
+
+J21 = os.path.join(ROOT, "jars", "h2-2.1.214.jar")
+
+
+@pytest.mark.skipif(not os.path.exists(J21), reason="h2-2.1.214.jar missing")
+def test_ccu_historian_413_compat(dbs, tmp_path):
+    """Merge into H2 2.1.214 and replay the DB accesses of CCU-Historian 4.1.3."""
+    import subprocess
+    import historian_compat as H
+    d, a, b, _ = dbs
+    stub = None
+    try:  # compile the DatabaseExtensions stub (needs a JDK)
+        cls = tmp_path / "stubcls"
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stub", "mdz", "ccuhistorian",
+                           "DatabaseExtensions.java")
+        subprocess.run(["javac", "--release", "11", "-d", str(cls), src], check=True, capture_output=True)
+        stub = str(cls)
+    except (OSError, subprocess.CalledProcessError):
+        pytest.skip("javac not available")
+    # database as created by CCU-Historian 4.1.3 (DP_ID GENERATED ALWAYS, version 4)
+    base = str(tmp_path / "hist4" / "history")
+    os.makedirs(os.path.dirname(base))
+    c = E.H2Driver.get(J21, [stub]).connect(f"jdbc:h2:file:{base}{H.URL_OPTS}", "sa", "ccu-historian")
+    H.prepare_database(c)
+    H.create_data_point_table(c, "D_BIDCOS_RF_LEQ0000001_1_TEMPERATURE", False)
+    H.create_data_point_entry(c, "D_BIDCOS_RF_LEQ0000001_1_TEMPERATURE", "BidCos-RF", "LEQ0000001:1", "TEMPERATURE")
+    c.close()
+    X = E.open_source("A", base + ".mv.db", J21, "sa", "ccu-historian", str(tmp_path / "w"))
+    A = E.open_source("B", a, J14, "sa", "", str(tmp_path / "w"))
+    X.scan()
+    A.scan()
+    out = str(tmp_path / "out" / "history.mv.db")
+    rep = E.MergeJob([E.SourceSpec(X), E.SourceSpec(A)],
+                     E.MergeOptions(output_path=out, target_jar=J21, workdir=str(tmp_path / "m"),
+                                    user="sa", password="ccu-historian")).run()
+    X.close()
+    A.close()
+    assert rep.ok, rep.summary()
+    assert E.inspect_db_file(out).fmt == 2
+    problems = H.historian_startup_check(out[:-6], J21, stub_jar=stub)
+    assert not problems, problems
